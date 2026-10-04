@@ -1,0 +1,30 @@
+{
+	"name": "pi-qq",
+	"version": "0.1.0",
+	"description": "/qq — quick side questions for pi that don't enter the conversation context (Claude Code's /btw, for pi)",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"side-question",
+		"btw"
+	],
+	"license": "MIT",
+	"type": "module",
+	"files": [
+		"index.ts",
+		"README.md"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.0.2",
+		"typescript": "^5.9.0"
+	}
+}
