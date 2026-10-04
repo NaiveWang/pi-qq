@@ -69,7 +69,13 @@ context). So during a side turn pi-qq:
 model needs it to answer "which of the two approaches…"). What `/qq` saves is
 the recurring cost — the exchange never rides along in every subsequent turn.
 
-## Load
+## Install
+
+```bash
+pi install npm:@elvinw/pi-qq
+```
+
+or from a local clone:
 
 ```bash
 pi --extension ./pi-qq
