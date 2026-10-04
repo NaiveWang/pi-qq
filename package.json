@@ -11,15 +11,10 @@
 	"license": "MIT",
 	"type": "module",
 	"files": [
-		"index.ts",
+		"extensions",
 		"README.md",
 		"LICENSE"
 	],
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
 	"publishConfig": {
 		"access": "public"
 	},
