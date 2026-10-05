@@ -29,7 +29,10 @@
  *              and the next message continues right after the answer.
  *
  * Both commands:
- *   - require the agent to be idle (works on single-slot llama.cpp, -np 1)
+ *   - if the agent is running, the question is QUEUED: it waits for the flow
+ *     to fully settle (agent_settled is the final boundary — retries,
+ *     continuations included) and then runs. Aborting the flow also
+ *     unblocks. Strictly serial, so single-slot llama.cpp (-np 1) is fine.
  *   - cancel auto-compaction for the duration of the side turn: a side
  *     question must never compact the MAIN conversation (if the compaction
  *     entry were stranded on the main line, it would truncate the real
@@ -61,8 +64,30 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 const QQ_SETTLE_TIMEOUT_MS = 5 * 60 * 1000;
 const QQ_IDLE_TIMEOUT_MS = 60 * 1000;
+const QQ_QUEUE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Wait for the next agent settle. Subscribe BEFORE re-checking idle so a
+ * settle landing in the gap between the caller's check and the subscription
+ * cannot be missed. Resolves false after QQ_QUEUE_TIMEOUT_MS so a broken
+ * settle can never wedge /qq (and the inFlight guard) forever.
+ */
+async function waitUntilSettled(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<boolean> {
+	let resolveSettled: () => void;
+	const settled = new Promise<void>((r) => (resolveSettled = r));
+	const off = pi.on("agent_settled", () => resolveSettled());
+	try {
+		if (ctx.isIdle()) return true; // settled in the gap between check and subscribe
+		const timeout = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), QQ_QUEUE_TIMEOUT_MS));
+		const result = await Promise.race([settled.then(() => "settled" as const), timeout]);
+		void timeout;
+		return result === "settled";
+	} finally {
+		off();
+	}
+}
 
 /** navigateTree refuses while a run or compaction is active; wait for true idle. */
 async function waitUntilIdle(ctx: ExtensionCommandContext, timeoutMs: number): Promise<boolean> {
@@ -285,14 +310,31 @@ export default function qqExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(`No model selected for /${label}.`, "warning");
 					return;
 				}
-				if (!ctx.isIdle()) {
-					ctx.ui.notify(`Wait for the current reply to finish (or abort it), then /${label}.`, "warning");
-					return;
-				}
-				preflightUsage(ctx, label);
 
 				inFlight = true;
 				try {
+					// Busy: QUEUE the question instead of rejecting it. Wait for
+					// the current flow to fully settle, then run. The loop
+					// re-checks after every settle so a run that starts right
+					// after one (queued continuation, new user message) is also
+					// waited out. Aborting the flow settles it and unblocks.
+					// homeLeaf is captured inside runInline — AFTER the wait —
+					// so the rewind target is the leaf the flow ended on.
+					let queued = false;
+					while (!ctx.isIdle()) {
+						if (!queued) {
+							queued = true;
+							ctx.ui.notify(`/${label}: agent is busy — queued, will run when the current flow settles (abort unblocks).`, "info");
+							ctx.ui.setStatus(label, "queued · waiting for the agent to settle");
+						}
+						if (!(await waitUntilSettled(pi, ctx))) {
+							ctx.ui.notify(`/${label}: gave up waiting after 2h — question dropped.`, "error");
+							return;
+						}
+					}
+					ctx.ui.setStatus(label, undefined);
+
+					preflightUsage(ctx, label);
 					await runInline(pi, ctx, label, question, policy);
 				} finally {
 					inFlight = false;

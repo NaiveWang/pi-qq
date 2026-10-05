@@ -108,6 +108,8 @@ against the published API; `node_modules/` is git-ignored.
   back immediately (nothing to read).
 - `/new`, `/fork`, or quit mid-question: the wait bails out; the side branch
   is just an orphan branch (harmless).
-- Double `/qq`/`/qqro` is rejected while one is running.
-- Requires the agent to be idle (also keeps it compatible with single-slot
-  llama.cpp, `-np 1`).
+- Double `/qq`/`/qqro` is rejected while one is running or queued.
+- If the agent is running, the question is **queued** and runs automatically
+  when the flow settles (aborting the flow unblocks it). Still strictly
+  serial — compatible with single-slot llama.cpp (`-np 1`). A 2h wait cap
+  drops the question rather than wedging the command.
