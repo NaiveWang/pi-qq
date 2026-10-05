@@ -23,10 +23,12 @@
 		"url": "git+https://github.com/NaiveWang/pi-qq.git"
 	},
 	"scripts": {
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "node --test \"test/**/*.test.ts\""
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "^1.0.2",
+		"@types/node": "^26.6.4",
 		"typescript": "^5.9.0"
 	}
 }

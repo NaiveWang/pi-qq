@@ -4,8 +4,9 @@
 		"module": "nodenext",
 		"moduleResolution": "nodenext",
 		"strict": true,
+		"allowImportingTsExtensions": true,
 		"skipLibCheck": true,
 		"noEmit": true
 	},
-	"include": ["extensions/**/*.ts"]
+	"include": ["extensions/**/*.ts", "test/**/*.ts"]
 }
