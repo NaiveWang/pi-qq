@@ -390,6 +390,10 @@ async function runInline(
 		// the Q&A and it becomes part of the live context. Thread ends.
 		if (data === "m" || data === "M") {
 			mode.exit();
+			// Close marker: without it a resumed session cannot tell a MERGED
+			// thread from an OPEN one (identical branch shape). Custom
+			// entries don't participate in the LLM context — it's free.
+			pi.appendEntry(label, { closed: true });
 			thread.root = null;
 			thread.sessionId = null;
 			ctx.ui.notify(`${label} merged — side Q&A is now part of the conversation.`, "info");
@@ -437,6 +441,58 @@ async function runInline(
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
+
+/** Structural view of a branch entry (message or custom marker). */
+type QqBranchEntry = {
+	id: string;
+	type: string;
+	customType?: string;
+	message?: { role: string; content: unknown };
+};
+
+/**
+ * Resume detection (see the session_start handler): the in-memory thread
+ * state dies with the process, but the thread itself lives in the session
+ * file. If the branch ENDS in side Q&A — a run of consecutive
+ * (marker, "label: question", assistant answer) triples, optionally
+ * followed by an UNANSWERED (marker, "label: question") pair (pi was exited
+ * while the follow-up was still streaming) — the user most likely quit
+ * mid-thread. Returns the thread root (the entry before the thread's first
+ * marker) plus whether the last question was answered, or null.
+ *
+ * A MERGED thread is distinguishable: the merge appends a close marker, so
+ * the branch no longer ends in a triple/pair. An ABSORBED thread (a normal
+ * message followed the side Q&A) likewise fails the walk.
+ */
+export function detectSideThreadRoot(
+	branch: QqBranchEntry[],
+): { root: string; answered: boolean } | null {
+	const isMarker = (e: QqBranchEntry) =>
+		e.type === "custom" && (e.customType === "qq" || e.customType === "qqro");
+	const isSideUser = (e: QqBranchEntry) =>
+		e.type === "message" &&
+		e.message?.role === "user" &&
+		typeof e.message.content === "string" &&
+		(e.message.content.startsWith("qq: ") || e.message.content.startsWith("qqro: "));
+	const isAnswer = (e: QqBranchEntry) => e.type === "message" && e.message?.role === "assistant";
+
+	let j = branch.length - 1;
+	let answered = true;
+	if (j >= 1 && isMarker(branch[j - 1]) && isSideUser(branch[j])) {
+		j -= 2; // trailing unanswered question (exited mid-stream)
+		answered = false;
+	}
+	let matched = false;
+	for (; j - 2 >= 0; j -= 3) {
+		if (isMarker(branch[j - 2]) && isSideUser(branch[j - 1]) && isAnswer(branch[j])) {
+			matched = true;
+			continue;
+		}
+		break;
+	}
+	if (!matched && answered) return null; // leaf is not part of any side Q&A
+	return j >= 0 ? { root: branch[j].id, answered } : null;
+}
 
 /** Warn (don't block) when the side turn is likely to overflow the window. */
 function preflightUsage(ctx: ExtensionCommandContext, label: string): void {
@@ -497,9 +553,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 		// side-thread title (restored by exitMode via setEditorComponent(undefined)).
 		ctx.ui.setEditorComponent((tui, theme, keybindings) => new QqSideEditor(tui, theme, keybindings));
 		ctx.ui.setStatus("qq", modeStatus());
+		// (session_start is handled by the PERMANENT handler below — one
+		// place that both voids the mode and re-detects a resumable thread.)
 		modeSubs = [
 			pi.on("input", onModeInput),
-			pi.on("session_start", dropThreadAndExit),
 			pi.on("session_compact", dropThreadAndExit),
 			pi.on("session_shutdown", exitMode),
 			pi.on("session_tree", (e) => {
@@ -520,20 +577,49 @@ export default function qqExtension(pi: ExtensionAPI) {
 	// wrapper immediately and it reads the live mode state per suggestion.
 	let autocompleteWrapped = false;
 	pi.on("session_start", (_event, ctx) => {
-		if (autocompleteWrapped) return;
-		autocompleteWrapped = true;
-		ctx.ui.addAutocompleteProvider((current) => ({
-			triggerCharacters: current.triggerCharacters,
-			shouldTriggerFileCompletion: current.shouldTriggerFileCompletion?.bind(current),
-			getSuggestions: (lines, line, col, opts) =>
-				current.getSuggestions(lines, line, col, opts).then((s) => {
-					if (!s) return s;
-					const hidden = new Set(sideMode ? ["qq", "qqro"] : ["ro", "nvm"]);
-					const items = s.items.filter((it) => !hidden.has(it.value));
-					return items.length === 0 ? null : { ...s, items };
-				}),
-			applyCompletion: (lines, line, col, item, prefix) => current.applyCompletion(lines, line, col, item, prefix),
-		}));
+		const c = ctx as ExtensionCommandContext;
+		if (!autocompleteWrapped) {
+			autocompleteWrapped = true;
+			c.ui.addAutocompleteProvider((current) => ({
+				triggerCharacters: current.triggerCharacters,
+				shouldTriggerFileCompletion: current.shouldTriggerFileCompletion?.bind(current),
+				getSuggestions: (lines, line, col, opts) =>
+					current.getSuggestions(lines, line, col, opts).then((s) => {
+						if (!s) return s;
+						const hidden = new Set(sideMode ? ["qq", "qqro"] : ["ro", "nvm"]);
+						const items = s.items.filter((it) => !hidden.has(it.value));
+						return items.length === 0 ? null : { ...s, items };
+					}),
+				applyCompletion: (lines, line, col, item, prefix) => current.applyCompletion(lines, line, col, item, prefix),
+			}));
+		}
+		// A session start voids any in-memory mode (and a resumed process has
+		// none) — but the thread itself lives in the session file. If the
+		// branch ends in side Q&A, the user exited pi mid-thread: re-anchor
+		// the thread. An ANSWERED thread re-enters the mode (plain text
+		// resumes the follow-up; /nvm drops it; m after an answer keeps it);
+		// an unanswered one (exited mid-stream) only restores the thread
+		// state so /nvm can still drop it.
+		const found = detectSideThreadRoot(c.sessionManager.getBranch() as QqBranchEntry[]);
+		if (found) {
+			exitMode();
+			thread.root = found.root;
+			thread.sessionId = c.sessionManager.getSessionId();
+			if (found.answered) {
+				enterMode(c);
+				c.ui.notify(
+					"Resumed the side thread you left open — type a follow-up · /ro read-only · /nvm drops it · m after an answer keeps it.",
+					"info",
+				);
+			} else {
+				c.ui.notify(
+					"You left a side question without an answer — /nvm drops the thread, or just continue in the main conversation.",
+					"info",
+				);
+			}
+		} else {
+			dropThreadAndExit();
+		}
 	});
 
 	// Plain editor input becomes the next side question while the side

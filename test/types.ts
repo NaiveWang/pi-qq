@@ -3,6 +3,7 @@
 export interface MockEntry {
 	id: string;
 	type: string; // "message" | "custom" | ...
+	customType?: string; // set when type === "custom" (mirrors pi's CustomEntry)
 	parentId: string | null;
 	message?: { role: string; content: unknown };
 }

@@ -48,6 +48,13 @@ until you decide its fate with your next keypress:
   (dismiss), run `/nvm` (drop the thread), or when a normal (non-`/qq`)
   message lands via another path (rpc driver etc.) — that message absorbs
   the thread: it can never be rewound away again.
+- **exit mid-thread** → the thread survives in the session file. When pi
+  next starts on that session, the extension detects that the conversation
+  ends in side Q&A and **re-opens the side thread**: an answered one re-
+  enters the mode (type to follow up, `/nvm` drops it, `m` after an answer
+  keeps it); one that was still streaming only restores the thread so
+  `/nvm` can still drop it. A merged thread (its merge left a context-
+  invisible close marker) and an absorbed one are correctly NOT re-opened.
 - **m** → **merge**: the side Q&A becomes part of the conversation and the
   next message continues right after the answer.
 - **any other key** → **dismiss**: the whole side thread (every question and
@@ -117,7 +124,7 @@ when it loads the extension.
 ```bash
 npm install        # pulls the published pi-coding-agent 1.0.2 types + tsc
 npm run typecheck
-npm test           # 43 scenario tests (node:test, no extra deps)
+npm test           # 48 scenario tests (node:test, no extra deps)
 ```
 
 The `pi-coding-agent` dev-dependency exists purely for local typechecking
@@ -147,6 +154,10 @@ needed). The scenario matrix covers:
 - **invariants** — zero leaked subscriptions on every path (including mode
   exit), compaction cancellation, tool guardrail (block/allow matrix),
   session swap, empty session, preflight warning
+- **resume** — pi exited mid-thread: answered thread re-enters the mode
+  (follow-up continues, dismiss drops the whole thread), merged/absorbed
+  threads are not re-opened, unanswered (mid-stream) restore only the
+  thread for `/nvm`, plain sessions untouched
 
 ## Safety
 
@@ -158,6 +169,10 @@ needed). The scenario matrix covers:
 - If an answer is aborted or errors before producing text, only that
   question is rewound away immediately (nothing to read); the rest of an
   in-progress thread survives.
+- Exitting pi mid-thread never loses the thread: it is re-detected from the
+  session file on the next start (see **exit mid-thread** above). Merge
+  leaves a context-invisible close marker so a resumed session can tell a
+  merged thread from an open one.
 - `/new`, `/fork`, or quit mid-question: the wait bails out; the side branch
   is just an orphan branch (harmless). Inside an open side thread these
   commands (and `/compact`, `/tree` navigation) **end the mode

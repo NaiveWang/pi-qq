@@ -84,7 +84,8 @@ export class MockPi {
 	/** pi.appendEntry: a custom marker entry that also lands in the session tree. */
 	appendEntry(type: string, data: unknown): void {
 		this.appended.push({ type, data });
-		this.session.add("custom", undefined);
+		const e = this.session.add("custom", undefined);
+		e.customType = type;
 	}
 
 	/** pi.sendUserMessage: appends the user entry, then simulates the agent run. */
