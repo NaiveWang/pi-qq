@@ -9,6 +9,20 @@ context** — the same idea as Claude Code's `/btw`.
 |---|---|
 | `/qq <question>` | prompt asks the model to use **no** tools |
 | `/qqro <question>` | prompt asks the model to use **only** read-only tools (`read`, `grep`, `find`, `ls`) |
+| `/ro` | Side thread: toggle the follow-up policy between no-tools and read-only |
+| `/nvm` | Side thread: **never mind** — exit the mode and rewind the whole thread to its first question, as if it never happened |
+
+The side thread is visible everywhere:
+
+- **Input box**: while the thread is open, the editor's top border becomes a
+  "qq side thread — … /ro read-only · /nvm back to main" title and the
+  footer status shows the live tool policy.
+- **Command list**: pi's command list is static (no unregister), so the mode
+  is reflected in autocomplete: inside the thread `/qq` and `/qqro`
+  disappear from the list (plain text is the question now); outside it `/ro`
+  and `/nvm` disappear. Hidden commands are still typeable — `/qq` inside
+  the thread just asks the next question, and `/ro`/`/nvm` outside it only
+  warn.
 
 Neither command touches the active tool set: the side request is a
 byte-identical prefix extension of your last turn, so on llama.cpp/vLLM it
@@ -26,11 +40,20 @@ cache is still intact for the next main turn). Tool policy is two-layer:
 The Q&A takes over the main transcript like a normal turn and **stays there**
 until you decide its fate with your next keypress:
 
-- **any key** → **dismiss**: the side branch is rewound away and the
-  conversation continues as if it never happened. Printable keys pass through,
-  so you can start typing your next prompt immediately.
-- **m** → **merge**: the Q&A becomes part of the conversation and the next
-  message continues right after the answer.
+- **f** → **open the side thread**: the input box becomes your side
+  conversation. **Plain text is the next side question** (answered with the
+  whole thread in context, no `/qq` prefix needed). `/ro` toggles the
+  follow-up policy, `/qq`/`/qqro` also work (explicit policy per question).
+  The mode ends when you: finish with **m** (merge) or any other key
+  (dismiss), run `/nvm` (drop the thread), or when a normal (non-`/qq`)
+  message lands via another path (rpc driver etc.) — that message absorbs
+  the thread: it can never be rewound away again.
+- **m** → **merge**: the side Q&A becomes part of the conversation and the
+  next message continues right after the answer.
+- **any other key** → **dismiss**: the whole side thread (every question and
+  answer in it) is rewound away and the conversation continues as if it never
+  happened. Printable keys pass through, so you can start typing your next
+  prompt immediately.
 
 Mechanically, a pi session is an append-only **tree** of entries and the model
 context is always built from the root→leaf path. `/qq` exploits that:
@@ -41,8 +64,9 @@ context is always built from the root→leaf path. `/qq` exploits that:
 2. Waits for the run to fully settle (`agent_settled`).
 3. Puts up "any key dismisses · m merges" (footer status + notification) and
    waits for **your** keypress.
-4. On dismiss, **snaps the leaf back** to `homeLeaf` (same mechanism as
-   `/tree`). On merge, it simply doesn't rewind.
+4. On dismiss, **snaps the leaf back** to the thread's root — the leaf before
+   the thread's first question, so a whole follow-up thread vanishes in one
+   keypress (same mechanism as `/tree`). On merge, it simply doesn't rewind.
 
 After a dismiss the exchange is excluded from all future model requests and
 compaction — but it remains in the session file as a dead branch, visible in
@@ -84,18 +108,45 @@ pi --extension ./pi-qq
 or place this directory in `~/.pi/agent/extensions/` (personal) or
 `.pi/extensions/` (project), then `/reload`.
 
-No `npm install` is needed to *run* it: the only import is `import type`,
-which is erased when pi loads the extension.
+No `npm install` is needed to *run* it: the only runtime import
+(`CustomEditor`, for the mode's input-box title) is provided by pi itself
+when it loads the extension.
 
 ## Development
 
 ```bash
 npm install        # pulls the published pi-coding-agent 1.0.2 types + tsc
 npm run typecheck
+npm test           # 43 scenario tests (node:test, no extra deps)
 ```
 
 The `pi-coding-agent` dev-dependency exists purely for local typechecking
 against the published API; `node_modules/` is git-ignored.
+
+### Tests
+
+`test/` runs the extension against a **mock pi environment** (the extension
+imports pi's types only — no runtime dependency — so a mock `ExtensionAPI`
+plus an in-memory session tree exercise the real logic, no pi process
+needed). The scenario matrix covers:
+
+- **lifecycle** — send → settle → PENDING → dismiss/merge, key semantics
+  (case, pass-through vs consume), status line, prompt notes
+- **threads** — follow-up chains, context inheritance, thread absorption by
+  a normal message, orphaning via `/tree`
+- **side-thread mode** — plain-text follow-ups, `/ro` toggling (and
+  non-reset on `f`), `/nvm` (with and without a thread, in-flight guard),
+  auto-exit on `/compact`/`/tree`/`/new` effects, recursion guard, slash
+  pass-through, in-flight guard, full e2e loop
+- **mode surface** — autocomplete hides `/ro`+`/nvm` outside the thread and
+  `/qq`+`/qqro` inside; the editor border carries the mode title in mode
+  only
+- **failures** — no answer, settle timeout, failed question mid-thread,
+  stuck-busy rewind
+- **queue** — busy-on-call, re-settle loop, queue timeout, in-flight guard
+- **invariants** — zero leaked subscriptions on every path (including mode
+  exit), compaction cancellation, tool guardrail (block/allow matrix),
+  session swap, empty session, preflight warning
 
 ## Safety
 
@@ -104,10 +155,17 @@ against the published API; `node_modules/` is git-ignored.
   and a `tool_call` guardrail blocks any out-of-policy call before it
   executes — the model sees the block reason as a tool error and answers in
   text instead. Nothing can write files or run commands during `/qq`.
-- If the answer is aborted or errors before producing text, the leaf snaps
-  back immediately (nothing to read).
+- If an answer is aborted or errors before producing text, only that
+  question is rewound away immediately (nothing to read); the rest of an
+  in-progress thread survives.
 - `/new`, `/fork`, or quit mid-question: the wait bails out; the side branch
-  is just an orphan branch (harmless).
+  is just an orphan branch (harmless). Inside an open side thread these
+  commands (and `/compact`, `/tree` navigation) **end the mode
+  automatically** — the thread is absorbed or orphaned and plain text goes
+  back to the main conversation.
+- In side-thread mode, plain text submitted while a question is still
+  streaming is dropped with a warning (strictly serial — one question at a
+  time, single-slot llama.cpp safe).
 - Double `/qq`/`/qqro` is rejected while one is running or queued.
 - If the agent is running, the question is **queued** and runs automatically
   when the flow settles (aborting the flow unblocks it). Still strictly
