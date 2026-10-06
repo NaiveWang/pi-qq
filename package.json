@@ -1,6 +1,6 @@
 {
 	"name": "@elvinw/pi-qq",
-	"version": "0.2.0",
+	"version": "0.2.1-patched.1",
 	"description": "/qq — quick side questions for pi that don't enter the conversation context (Claude Code's /btw, for pi)",
 	"keywords": [
 		"pi-package",
@@ -27,7 +27,7 @@
 		"test": "node --test \"test/**/*.test.ts\""
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "^1.0.2",
+		"@earendil-works/pi-coding-agent": "1.0.2",
 		"@types/node": "^26.6.4",
 		"typescript": "^5.9.0"
 	}

@@ -49,6 +49,30 @@ export class MockSession {
 		this.add("message", { role: "assistant", content: [{ type: "text", text: "main answer" }] });
 	}
 
+	/**
+	 * Patched-core tier simulation: tests set `pruneBranches` to make
+	 * dropThread take the PRUNE tier (it is undefined by default, i.e.
+	 * "unpatched pi" — the ladder then falls to fork/rewind).
+	 */
+	pruneBranches?: (keepLeafId?: string) => number;
+	/** keepLeafIds passed to pruneBranches. */
+	pruneCalls: string[] = [];
+	/** Drop every branch not on the root→keepLeafId path; re-pin the leaf. */
+	pruneSim(keepLeafId?: string): number {
+		const target = keepLeafId ?? this.leafId;
+		const keep = new Set<string>();
+		let cur: string | null | undefined = target;
+		while (cur && this.entries.has(cur)) {
+			keep.add(cur);
+			cur = this.entries.get(cur)!.parentId;
+		}
+		const before = this.entries.size;
+		for (const id of [...this.entries.keys()]) if (!keep.has(id)) this.entries.delete(id);
+		this.leafId = target;
+		this.pruneCalls.push(target ?? "");
+		return before - this.entries.size;
+	}
+
 	/** Find the entry whose user text starts with a prefix (side messages are "qq: ..."). */
 	findUserEntry(prefix: string): MockEntry | undefined {
 		return this.branch().find(
@@ -67,6 +91,30 @@ export class MockCtx {
 	navigatedTo: string[] = [];
 	model = { id: "mock-model", provider: "mock" };
 	contextUsage: { tokens: number | null; contextWindow: number } | null = null;
+	/**
+	 * FORK tier simulation: tests install this to make dropThread take the
+	 * FORK tier (undefined by default — the ladder then falls to rewind).
+	 */
+	fork?: (entryId: string, options?: { position?: "before" | "at"; withSession?: (c: { ui: { notify: (m: string, l?: string) => void } }) => void | Promise<void> }) => Promise<{ cancelled: boolean }>;
+	forkCalls: Array<{ entryId: string; options?: { position?: "before" | "at"; withSession?: unknown } }> = [];
+	/** Notices emitted through the withSession callback after a simulated fork. */
+	forkReplacedNotifs: { message: string; level?: string }[] = [];
+	/** Install a successful fork simulation (records calls, fires withSession). */
+	installForkSim(): void {
+		this.fork = async (entryId, options) => {
+			this.forkCalls.push({ entryId, options });
+			if (options?.withSession)
+				await options.withSession({
+					ui: {
+						notify: (message, level) => {
+							this.forkReplacedNotifs.push({ message, level });
+						},
+					},
+				});
+			return { cancelled: false };
+		};
+	}
+
 	/** Autocomplete wrapper factories passed to ui.addAutocompleteProvider. */
 	autocompleteFactories: Array<(current: unknown) => unknown> = [];
 	/** setEditorComponent calls, in order (last = current; undefined = default). */

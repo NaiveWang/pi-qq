@@ -1,3 +1,8 @@
+# Tag families (both start with v, so a single pattern covers both):
+#   v0.2.1            → mainline build        → npm dist-tag `latest`
+#   v0.2.1-patched.1  → patched-core build    → npm dist-tag `patched`
+# The -patched.* tags live on the patched-core-0.2.x branch, so the
+# checkout lands on that branch's code and version.
 name: publish
 on:
   push:
@@ -17,4 +22,9 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run typecheck
-      - run: npm publish --provenance
+      - run: |
+          if [[ "$GITHUB_REF_NAME" == *"-patched."* ]]; then
+            npm publish --provenance --tag patched
+          else
+            npm publish --provenance
+          fi

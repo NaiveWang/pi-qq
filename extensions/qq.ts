@@ -79,12 +79,17 @@
  *   4. If no assistant reply was produced (aborted before answering), rewind
  *      immediately — nothing to read.
  *
- * After a dismiss the exchange remains in the session file as a dead branch,
- * visible in /tree (auditability; you can re-attach it later by navigating to
- * it). Nothing is copied or deleted; pi never rewrites history.
+ * After a dismiss, the thread is dropped by the first tier that works
+ * (see dropThread): on this branch (patched-core-0.2.x, pinned to an
+ * EXACT pi version) the thread is PRUNED from the session file —
+ * physically gone; on plain upstream pi it is forked away (new file,
+ * mainline only) or, on old pi, rewound (dead branch left in /tree).
  */
 
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { CustomEditor, SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -103,7 +108,164 @@ export const config = {
 	idleTimeoutMs: 60 * 1000,
 	/** How long a queued question may wait for the agent to settle. */
 	queueTimeoutMs: 2 * 60 * 60 * 1000,
+	/**
+	 * Patched-core line (this branch): the EXACT pi version the
+	 * pruneBranches self-patch targets. No ranges — the patch touches
+	 * private-by-convention internals that may drift on any release.
+	 */
+	patchTargetPiVersion: "1.0.2",
 };
+
+// ── Patched core (this branch only): true deletion of dismissed threads ──
+//
+// Mainline pi is append-only: a dismissed thread can at best be ORPHANED
+// (leaf moved back; the entries stay in the file/tree). This branch closes
+// that gap by ADDITIVELY installing `pruneBranches(keepLeafId?)` on
+// SessionManager.prototype at load time — and ONLY when the running pi
+// version EXACTLY matches config.patchTargetPiVersion. Additive by design:
+// an existing (native) pruneBranches is never overridden, and a version
+// mismatch leaves the class untouched (the drop ladder degrades to
+// fork/rewind instead of risking a bad rewrite).
+
+/** Structural view of the SessionManager internals the patch relies on. */
+interface SessionManagerInternal {
+	fileEntries: Array<{ type: string; id: string; parentId: string | null }>;
+	byId: Map<string, { id: string; parentId: string | null }>;
+	leafId: string | null;
+	_buildIndex(): void;
+	_rewriteFile(): void;
+}
+
+export interface PruneInstallStatus {
+	installed: boolean;
+	/** True when pi already ships a native pruneBranches (we stand down). */
+	native?: boolean;
+	/** Why the patch was not installed (installed === false). */
+	reason?: string;
+}
+
+/**
+ * Version of the RUNNING pi package (the extension loads inside it).
+ * pi's exports map has no "require" condition, so plain require.resolve is
+ * not an option; try several anchors and validate the package NAME at each
+ * candidate (a wrong package.json must never be trusted):
+ *  A. import.meta.resolve (ESM "import" condition — the running pi)
+ *  B. walk up from this file (repo/dev layout: our own node_modules)
+ *  C. the process entry point (production: pi's own dist entry)
+ */
+function readPiVersion(): string | undefined {
+	const candidates: string[] = [];
+	const meta = import.meta as { resolve?: (s: string) => string };
+	if (typeof meta.resolve === "function") {
+		try {
+			candidates.push(join(dirname(fileURLToPath(meta.resolve("@earendil-works/pi-coding-agent"))), "..", "package.json"));
+		} catch {
+			// fall through
+		}
+	}
+	for (let dir = dirname(fileURLToPath(import.meta.url)); ; dir = dirname(dir)) {
+		candidates.push(join(dir, "node_modules", "@earendil-works", "pi-coding-agent", "package.json"));
+		if (dir === dirname(dir)) break;
+	}
+	if (process.argv[1]) candidates.push(join(dirname(process.argv[1]), "..", "package.json"));
+	for (const p of candidates) {
+		try {
+			const pkg = JSON.parse(readFileSync(p, "utf8")) as { name?: string; version?: string };
+			if (pkg.name === "@earendil-works/pi-coding-agent" && typeof pkg.version === "string") return pkg.version;
+		} catch {
+			// try the next candidate
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Install `pruneBranches(keepLeafId?)` on SessionManager.prototype when
+ * (and only when) the running pi exactly matches config.patchTargetPiVersion
+ * and the required internals are present. Idempotent.
+ *
+ * The installed method keeps only the root→keepLeafId path, drops every
+ * other branch, rebuilds pi's own in-memory index (_buildIndex), re-pins
+ * the leaf, and rewrites the session file (_rewriteFile). Returns the
+ * number of removed entries.
+ */
+export function installSessionPrune(): PruneInstallStatus {
+	const version = readPiVersion();
+	if (version !== config.patchTargetPiVersion) {
+		return { installed: false, reason: `pi ${version ?? "unknown"} ≠ required ${config.patchTargetPiVersion}` };
+	}
+	const proto = SessionManager.prototype as unknown as Record<string, unknown>;
+	if (typeof proto.pruneBranches === "function") return { installed: true, native: true };
+	if (typeof proto._buildIndex !== "function" || typeof proto._rewriteFile !== "function") {
+		return { installed: false, reason: "SessionManager internals (_buildIndex/_rewriteFile) missing" };
+	}
+	(proto as { pruneBranches: unknown }).pruneBranches = function (this: SessionManagerInternal, keepLeafId?: string): number {
+		const target = keepLeafId ?? this.leafId;
+		if (!target || !this.byId.has(target)) throw new Error(`pruneBranches: unknown entry ${String(target)}`);
+		const keep = new Set<string>();
+		for (let id: string | null = target; id; id = this.byId.get(id)?.parentId ?? null) keep.add(id);
+		const before = this.fileEntries.length;
+		this.fileEntries = this.fileEntries.filter((e) => e.type === "session" || keep.has(e.id));
+		this._buildIndex(); // pi's own state rebuild (byId, labels, leaf)
+		this.leafId = target; // _buildIndex pins the leaf to last-in-file; re-pin
+		this._rewriteFile(); // pi's own file writer
+		return before - this.fileEntries.length;
+	};
+	return { installed: true };
+}
+
+/** Set once when the extension loads (module-global: the patch is on the
+ *  prototype, i.e. process-global, so a module-global status matches it). */
+let pruneStatus: PruneInstallStatus = { installed: false, reason: "not installed yet" };
+
+/**
+ * Drop a side thread anchored at `target` (the leaf before its first
+ * question). Ladder — the first tier that succeeds wins:
+ *
+ *  1. PRUNE  (patched core — this branch): the thread is physically
+ *     removed from the session file: no dead branch in /tree, no dead
+ *     fork file, same session id. (Also tidies any other orphans.)
+ *  2. FORK   (upstream pi ≥ 0.69): switch to a new session file holding
+ *     only root→target; the old file (with the thread) stays on disk.
+ *  3. REWIND (any pi): orphan the thread — it leaves the context, the
+ *     entries remain in the tree.
+ *
+ * The success notice is emitted HERE, per tier: after FORK the caller's
+ * ctx is stale (session replaced) and must not be touched.
+ */
+async function dropThread(
+	ctx: ExtensionCommandContext,
+	sessionId: string,
+	target: string,
+): Promise<"pruned" | "forked" | "rewound"> {
+	const sm = ctx.sessionManager as unknown as { pruneBranches?: (keepLeafId?: string) => number };
+	if (
+		pruneStatus.installed &&
+		typeof sm.pruneBranches === "function" &&
+		ctx.sessionManager.getSessionId() === sessionId &&
+		(await waitUntilIdle(ctx, config.idleTimeoutMs))
+	) {
+		sm.pruneBranches(target);
+		ctx.ui.notify("Side thread removed from the session.", "info");
+		return "pruned";
+	}
+	if (typeof ctx.fork === "function" && ctx.sessionManager.getSessionId() === sessionId) {
+		try {
+			const { cancelled } = await ctx.fork(target, {
+				position: "at",
+				withSession: async (fresh) => {
+					fresh.ui.notify("Side thread removed (the session was re-created without it).", "info");
+				},
+			});
+			if (!cancelled) return "forked";
+		} catch {
+			// fork failed mid-flight — fall through to the rewind tier.
+		}
+	}
+	await rewindLeaf(ctx, sessionId, target);
+	ctx.ui.notify("Side thread removed from the conversation.", "info");
+	return "rewound";
+}
 
 /**
  * Editor variant shown while the side thread is open: the top border
@@ -409,21 +571,21 @@ async function runInline(
 			return { consume: true };
 		}
 
-		// anything else: DISMISS — rewind the WHOLE side thread away. The
-		// thread state is cleared only AFTER a successful rewind so a failed
-		// one can be retried with another /qq.
+		// anything else: DISMISS — drop the WHOLE side thread via the ladder
+		// (prune → fork → rewind; see dropThread, which emits the success
+		// notice itself). The thread state is cleared only AFTER a
+		// successful drop so a failed one can be retried with another /qq.
 		mode.exit();
 		void (async () => {
 			try {
 				if (sm.getLeafId() === leaf) {
 					const target = thread.root ?? homeLeaf;
-					await rewindTo(target);
+					await dropThread(ctx, sessionId, target);
 				}
 				thread.root = null;
 				thread.sessionId = null;
-				ctx.ui.notify(`${label} dismissed — side thread removed from the conversation.`, "info");
 			} catch (e) {
-				ctx.ui.notify(`/${label} rewind failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
+				ctx.ui.notify(`/${label} dismiss failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
 			}
 		})();
 		// Swallow control/escape keys (so they don't trigger editor actions);
@@ -450,6 +612,11 @@ function preflightUsage(ctx: ExtensionCommandContext, label: string): void {
 }
 
 export default function qqExtension(pi: ExtensionAPI) {
+	// Patched-core line: install SessionManager.pruneBranches when the
+	// running pi exactly matches config.patchTargetPiVersion. On any
+	// mismatch this is a no-op and the drop ladder degrades to fork/rewind.
+	pruneStatus = installSessionPrune();
+
 	let inFlight = false;
 	// The active side thread: root is the leaf before the thread's first
 	// question — a dismiss rewinds the WHOLE thread back to it. Cleared on
@@ -653,10 +820,9 @@ export default function qqExtension(pi: ExtensionAPI) {
 			exitMode();
 			if (root) {
 				try {
-					await rewindLeaf(ctx, sessionId, root);
+					await dropThread(ctx, sessionId, root);
 					thread.root = null;
 					thread.sessionId = null;
-					ctx.ui.notify("Side thread dismissed — you're back on the main conversation.", "info");
 				} catch (err) {
 					// Keep the thread state so /qq + any key can retry the rewind.
 					ctx.ui.notify(
