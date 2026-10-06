@@ -88,13 +88,16 @@ test("happy path: marker + labeled message, PENDING, dismiss rewinds to homeLeaf
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
 });
 
-test("merge (m): leaf stays at the answer, thread ends", async () => {
+test("merge (m): no rewind, close marker at the leaf, thread ends", async () => {
 	const env = makeEnv({ answer: "a1" });
 	const p = await toPending(env, "qq", "q1");
 	const leafAtAnswer = env.session.leafId!;
 	env.ctx.press("m");
 	await p;
-	assert.equal(env.session.leafId, leafAtAnswer, "no rewind on merge");
+	assert.ok(env.session.branch().some((e) => e.id === leafAtAnswer), "the answer stays in the branch");
+	const leafEntry = env.session.branch().at(-1);
+	assert.equal(leafEntry?.type, "custom", "close marker at the leaf");
+	assert.equal(leafEntry?.customType, "qq", "close marker carries the label");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("merged")));
 
 	// Thread ended: a NEW side question starts a fresh thread — dismissing it
@@ -376,7 +379,11 @@ test("session_start (new/fork) in mode exits the mode", async () => {
 	env.ctx.press("f");
 	await p1;
 
-	env.session.sessionId = "session-2";
+	// A new session has an EMPTY branch (the old one is gone).
+	const fresh = new MockSession();
+	env.session = fresh;
+	env.ctx.sessionManager = fresh;
+	env.pi.session = fresh;
 	env.pi.emit("session_start", { type: "session_start", reason: "new" });
 	assert.deepEqual(await submitInput(env, "x"), [], "session change ended the mode");
 });
@@ -812,7 +819,87 @@ test("preflight: ≥90% context warns, below does not", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 10. Patched core (this branch): pruneBranches self-patch + drop ladder
+// 10. Resume (pi exited mid-thread → session_start re-anchors the follow-up)
+// ---------------------------------------------------------------------------
+
+test("resuming a session that ends in a side thread re-enters the mode", async () => {
+	const env = makeEnv({ answer: "a1" });
+	const root = env.session.leafId!;
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	const p2 = submitInput(env, "q2");
+	await waitFor(() => isPending(env), "PENDING for q2");
+	env.ctx.press("f");
+	await p2;
+
+	// Exit + resume: pi starts again on the same session file.
+	env.pi.emit("session_start", { reason: "resume" });
+	assert.notEqual(env.ctx.editorComponent, undefined, "mode re-entered");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("Resumed the side thread")));
+
+	// The follow-up is resumed: plain text is the next side question, same thread.
+	const p3 = submitInput(env, "q3");
+	await waitFor(() => isPending(env), "PENDING for q3");
+	assert.ok((env.pi.sentMessages.at(-1) ?? "").startsWith("qq: q3"));
+
+	// Dismissing drops the WHOLE thread (q1, q2, q3) back to its root.
+	env.ctx.press("x");
+	await p3;
+	await waitFor(() => env.session.leafId === root, "dropped back to the thread root");
+	assert.equal(env.ctx.editorComponent, undefined, "mode off");
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
+});
+
+test("resume does NOT re-open a MERGED thread (close marker at the leaf)", async () => {
+	const env = makeEnv({ answer: "a1" });
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("m"); // merge → close marker appended
+	await p1;
+	env.pi.emit("session_start", { reason: "resume" });
+	assert.equal(env.ctx.editorComponent, undefined, "no mode: the thread was merged");
+	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+});
+
+test("resume does NOT re-open an ABSORBED thread (normal message after the Q&A)", async () => {
+	const env = makeEnv({ answer: "a1" });
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	// A normal message landed via another path (rpc) — it absorbs the thread.
+	env.session.add("message", { role: "user", content: "back to work" });
+	env.session.add("message", { role: "assistant", content: [{ type: "text", text: "ok" }] });
+	env.pi.emit("session_start", { reason: "resume" });
+	assert.equal(env.ctx.editorComponent, undefined, "no mode");
+	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+});
+
+test("resume with an UNANSWERED trailing question restores the thread without the mode", async () => {
+	const env = makeEnv({ answer: "a1" });
+	const root = env.session.leafId!;
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	// Exited while the follow-up was still streaming: marker + question, no answer.
+	env.pi.appendEntry("qq", { question: "q2" });
+	env.session.add("message", { role: "user", content: "qq: q2\n\n(note)" });
+	env.pi.emit("session_start", { reason: "resume" });
+	assert.equal(env.ctx.editorComponent, undefined, "no mode (nothing to follow up on)");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("without an answer")));
+	// /nvm can still drop the whole thread.
+	await run(env, "nvm", "");
+	await waitFor(() => env.session.leafId === root, "dropped back to the thread root");
+});
+
+test("resume of a plain session (no side markers) does nothing", async () => {
+	const env = makeEnv();
+	env.pi.emit("session_start", { reason: "resume" });
+	assert.equal(env.ctx.editorComponent, undefined);
+	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+});
+
+// ---------------------------------------------------------------------------
+// 11. Patched core (this branch): pruneBranches self-patch + drop ladder
 // ---------------------------------------------------------------------------
 
 test("installSessionPrune installs on the exact pinned pi version", () => {
