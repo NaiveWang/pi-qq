@@ -9,20 +9,20 @@ context** — the same idea as Claude Code's `/btw`.
 |---|---|
 | `/qq <question>` | prompt asks the model to use **no** tools |
 | `/qqro <question>` | prompt asks the model to use **only** read-only tools (`read`, `grep`, `find`, `ls`) |
-| `/ro` | Side thread: toggle the follow-up policy between no-tools and read-only |
-| `/nvm` | Side thread: **never mind** — exit the mode and rewind the whole thread to its first question, as if it never happened |
+| `/ro` | Side thread **only**: toggle the follow-up policy between no-tools and read-only |
+| `/nvm` | Side thread **only**: **never mind** — exit the mode and rewind the whole thread to its first question, as if it never happened |
 
 The side thread is visible everywhere:
 
 - **Input box**: while the thread is open, the editor's top border becomes a
   "qq side thread — … /ro read-only · /nvm back to main" title and the
   footer status shows the live tool policy.
-- **Command list**: pi's command list is static (no unregister), so the mode
-  is reflected in autocomplete: inside the thread `/qq` and `/qqro`
-  disappear from the list (plain text is the question now); outside it `/ro`
-  and `/nvm` disappear. Hidden commands are still typeable — `/qq` inside
-  the thread just asks the next question, and `/ro`/`/nvm` outside it only
-  warn.
+- **Command list**: hidden == not dispatchable. Inside the thread `/qq` and
+  `/qqro` disappear from the list **and do not run either** (plain text is
+  the question now). `/ro` and `/nvm` are not registered commands at all —
+  an input-level handler owns them while the thread is open, and outside it
+  they pass through to the model as ordinary messages, exactly like any
+  unknown slash text.
 
 Neither command touches the active tool set: the side request is a
 byte-identical prefix extension of your last turn, so on llama.cpp/vLLM it
@@ -43,11 +43,11 @@ until you decide its fate with your next keypress:
 - **f** → **open the side thread**: the input box becomes your side
   conversation. **Plain text is the next side question** (answered with the
   whole thread in context, no `/qq` prefix needed). `/ro` toggles the
-  follow-up policy, `/qq`/`/qqro` also work (explicit policy per question).
-  The mode ends when you: finish with **m** (merge) or any other key
-  (dismiss), run `/nvm` (drop the thread), or when a normal (non-`/qq`)
-  message lands via another path (rpc driver etc.) — that message absorbs
-  the thread: it can never be rewound away again.
+  follow-up policy. The mode ends when you: finish with **m** (merge) or
+  any other key (dismiss), run `/nvm` (drop the thread), or when a normal
+  (non-`/qq`) message lands via another path (rpc driver, unknown slash
+  text, …) — that message absorbs the thread: it can never be rewound away
+  again.
 - **exit mid-thread** → the thread survives in the session file. When pi
   next starts on that session, the extension detects that the conversation
   ends in side Q&A and **re-opens the side thread**: an answered one re-
@@ -145,9 +145,10 @@ needed). The scenario matrix covers:
   non-reset on `f`), `/nvm` (with and without a thread, in-flight guard),
   auto-exit on `/compact`/`/tree`/`/new` effects, recursion guard, slash
   pass-through, in-flight guard, full e2e loop
-- **mode surface** — autocomplete hides `/ro`+`/nvm` outside the thread and
-  `/qq`+`/qqro` inside; the editor border carries the mode title in mode
-  only
+- **mode surface** — autocomplete hides `/qq`+`/qqro` inside the thread and
+  hidden == not dispatched (`/ro` and `/nvm` are input-level, not
+  commands, and pass through as ordinary messages outside the thread);
+  the editor border carries the mode title in mode only
 - **failures** — no answer, settle timeout, failed question mid-thread,
   stuck-busy rewind
 - **queue** — busy-on-call, re-settle loop, queue timeout, in-flight guard

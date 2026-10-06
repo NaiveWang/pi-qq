@@ -182,16 +182,41 @@ export async function waitFor(cond: () => boolean, what: string, ms = 3000): Pro
 export const isPending = (env: Env): boolean => env.ctx.terminal.size > 0;
 
 /**
- * Submit text through the `input` event (as pi's editor would) and await all
- * handlers. NOTE: while the side thread is open, a plain-text submission
- * resolves only AFTER the resulting side question reaches its keypress —
- * fire it (const p = submitInput(...)), wait for PENDING, press, then await p.
+ * Submit text the way pi's editor would (agent-session prompt()):
+ *  1. if the text is a registered slash command, dispatch it IMMEDIATELY
+ *     (before the input event — extension commands manage their own LLM
+ *     interaction and cannot be intercepted by input handlers);
+ *  2. otherwise fire the `input` event — handlers run in registration
+ *     order, and a `{action: "handled"}` result short-circuits the rest (pi
+ *     consumes it);
+ *  3. otherwise it becomes a plain model message (what pi does with unknown
+ *     slash text too).
+ * NOTE: while the side thread is open, a plain-text submission resolves only
+ * AFTER the resulting side question reaches its keypress — fire it
+ * (const p = submitInput(...)), wait for PENDING, press, then await p.
  */
 export async function submitInput(
 	env: Env,
 	text: string,
 	source: "interactive" | "rpc" | "extension" = "interactive",
-): Promise<unknown[]> {
-	const results = env.pi.emit("input", { type: "input", text, source });
-	return Promise.all(results as Promise<unknown>[]);
+): Promise<"consumed" | "command" | "message"> {
+	if (text.startsWith("/")) {
+		const space = text.indexOf(" ");
+		const name = space === -1 ? text.slice(1) : text.slice(1, space);
+		const cmd = env.pi.commands.get(name);
+		if (cmd) {
+			await cmd.handler(space === -1 ? "" : text.slice(space + 1), env.ctx as unknown as ExtensionCommandContext);
+			return "command";
+		}
+	}
+	for (const h of env.pi.listeners.get("input") ?? []) {
+		const r = (await h({ type: "input", text, source }, env.ctx)) as { action?: string } | undefined;
+		if (r?.action === "handled") return "consumed";
+	}
+	env.pi.sentMessages.push(text);
+	// Faithful to pi: an unconsumed input becomes a user message on the
+	// current leaf (which, if it lands after a thread root, absorbs the
+	// thread into the conversation).
+	env.session.add("message", { role: "user", content: text });
+	return "message";
 }

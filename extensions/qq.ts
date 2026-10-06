@@ -191,6 +191,27 @@ interface ModeCtl {
 	exit: () => void;
 }
 
+/**
+ * A "real" user turn: a user message that is NOT one of our own labeled
+ * side questions. The first real turn after the thread root absorbs the
+ * thread into the conversation — it can never be rewound away again.
+ */
+function isRealTurn(e: { type?: string; message?: { role?: string; content?: unknown } }): boolean {
+	if (e.type !== "message") return false;
+	const m = e.message;
+	if (!m || m.role !== "user") return false;
+	const text =
+		typeof m.content === "string"
+			? m.content
+			: Array.isArray(m.content)
+				? (m.content as { type?: string; text?: string }[])
+						.filter((x) => x?.type === "text")
+						.map((x) => x.text ?? "")
+						.join(" ")
+				: "";
+	return !text.startsWith("qq: ") && !text.startsWith("qqro: ");
+}
+
 async function runInline(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -219,22 +240,7 @@ async function runInline(
 	if (thread.root && thread.sessionId === sessionId) {
 		const b = sm.getBranch(sm.getLeafId() ?? undefined);
 		const i = b.findIndex((e) => e.id === thread.root);
-		const realTurn = (i >= 0 ? b.slice(i + 1) : []).some((e) => {
-			if (e.type !== "message") return false;
-			const m = e.message as { role?: string; content?: unknown };
-			if (m.role !== "user") return false;
-			const text =
-				typeof m.content === "string"
-					? m.content
-					: Array.isArray(m.content)
-						? (m.content as { type?: string; text?: string }[])
-								.filter((x) => x?.type === "text")
-								.map((x) => x.text ?? "")
-								.join(" ")
-							: "";
-			return !text.startsWith("qq: ") && !text.startsWith("qqro: ");
-		});
-		if (i < 0 || realTurn) {
+		if (i < 0 || b.slice(i + 1).some(isRealTurn)) {
 			thread.root = null;
 			thread.sessionId = null;
 			mode.exit();
@@ -513,6 +519,18 @@ export default function qqExtension(pi: ExtensionAPI) {
 	// absorbed (a real turn continues the branch) or orphaned (/tree away).
 	const thread: ThreadState = { root: null, sessionId: null };
 
+	/** Can the recorded thread still be rewound away? False once it has been
+	 *  absorbed (a real, unlabeled turn landed after the root — the branch is
+	 *  now the conversation), orphaned (the root is off the active path, e.g.
+	 *  /tree'd away), or left behind in another session (/new, /resume). */
+	const threadAlive = (sm: ExtensionCommandContext["sessionManager"]): boolean => {
+		if (!thread.root || !thread.sessionId) return false;
+		if (sm.getSessionId() !== thread.sessionId) return false;
+		const b = sm.getBranch(sm.getLeafId() ?? undefined);
+		const i = b.findIndex((e) => e.id === thread.root);
+		return i >= 0 && !b.slice(i + 1).some(isRealTurn);
+	};
+
 	// ── Side-thread mode (opened with "f" on a side answer) ──────────────
 	// While active, plain editor input is hijacked into the next side
 	// question. The mode CANNOT outlive its thread: built-in pi commands
@@ -570,11 +588,13 @@ export default function qqExtension(pi: ExtensionAPI) {
 
 	// The slash-command list is static (pi has no unregister), so the mode is
 	// reflected in the AUTOCOMPLETE surface instead: while the side thread is
-	// open, /qq and /qqro disappear from the list (plain text is the question);
-	// while it is closed, /ro and /nvm disappear (they only warn outside the
-	// thread). Hidden commands stay typeable. Registered once, on the first
-	// session_start (fires at startup); addAutocompleteProvider applies the
-	// wrapper immediately and it reads the live mode state per suggestion.
+	// open, /qq and /qqro disappear from the list — and their handlers
+	// decline to run in-mode (hidden == not executed; plain text is the
+	// question now). /ro and /nvm are not registered commands at all —
+	// they only exist while the thread is open. Registered
+	// once, on the first session_start (fires at startup);
+	// addAutocompleteProvider applies the wrapper immediately and it reads
+	// the live mode state per suggestion.
 	let autocompleteWrapped = false;
 	pi.on("session_start", (_event, ctx) => {
 		const c = ctx as ExtensionCommandContext;
@@ -586,7 +606,7 @@ export default function qqExtension(pi: ExtensionAPI) {
 				getSuggestions: (lines, line, col, opts) =>
 					current.getSuggestions(lines, line, col, opts).then((s) => {
 						if (!s) return s;
-						const hidden = new Set(sideMode ? ["qq", "qqro"] : ["ro", "nvm"]);
+						const hidden = new Set(sideMode ? ["qq", "qqro"] : []);
 						const items = s.items.filter((it) => !hidden.has(it.value));
 						return items.length === 0 ? null : { ...s, items };
 					}),
@@ -627,12 +647,21 @@ export default function qqExtension(pi: ExtensionAPI) {
 	//  - our own side messages (sendUserMessage arrives with source
 	//    "extension" — hijacking those would recurse forever);
 	//  - rpc/extension drivers (a remote caller never meant a side question);
-	//  - slash input: built-ins are handled by pi before this event, /ro and
-	//    /nvm are extension commands dispatched before this event, and
-	//    /qq… works as-is; anything else passes through untouched.
-	async function onModeInput(event: InputEvent): Promise<InputEventResult> {
+	//  - slash input: built-ins are handled by pi before prompt() at all;
+	//    /qq and /qqro are registered commands dispatched before this
+	//    event (their in-mode guard lives in the command handler); /ro and
+	//    /nvm are consumed by the permanent input handler (registered
+	//    before this one); anything else passes through untouched.
+	async function onModeInput(event: InputEvent, ctx: unknown): Promise<InputEventResult> {
 		if (!sideMode) return { action: "continue" };
 		if (event.source !== "interactive") return { action: "continue" };
+		// The mode cannot outlive its thread: if it has been absorbed (a real,
+		// unlabeled turn landed — e.g. via an rpc driver) or orphaned, this
+		// input is a REAL message, not a follow-up.
+		if (!threadAlive((ctx as ExtensionCommandContext).sessionManager)) {
+			exitMode();
+			return { action: "continue" };
+		}
 		const text = event.text.trim();
 		if (!text) return { action: "handled" }; // never let an empty prompt through in mode
 		if (text.startsWith("/")) return { action: "continue" };
@@ -691,6 +720,17 @@ export default function qqExtension(pi: ExtensionAPI) {
 		pi.registerCommand(label, {
 			description,
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
+				// Hidden == not executed: inside a LIVE side thread, /qq and
+				// /qqro are hidden from the list — but pi's registry is static
+				// and it dispatches registered commands BEFORE the input event
+				// (agent-session prompt()), so the guard has to live here:
+				// decline with a pointer at what plain text already does. (If
+				// the thread has already been absorbed, /qq is the cleanup path
+				// — let it run.)
+				if (sideMode && threadAlive(ctx.sessionManager)) {
+					ctx.ui.notify("Already in the side thread — just type the follow-up (or /nvm to leave).", "info");
+					return;
+				}
 				const question = args.trim();
 				if (!question) {
 					ctx.ui.notify(`Usage: /${label} <question>`, "warning");
@@ -706,46 +746,48 @@ export default function qqExtension(pi: ExtensionAPI) {
 		"Quick side question (read-only tools only) — f follow-up, m merges, any other key dismisses",
 	);
 
-	pi.registerCommand("ro", {
-		description: "Side thread: toggle read-only tools for follow-ups (works after f)",
-		handler: async (_args: string, ctx: ExtensionCommandContext) => {
-			if (!sideMode) {
-				ctx.ui.notify("Not in a side thread — /ro only works after you press f on a side answer.", "warning");
-				return;
-			}
+	// /ro and /nvm are MODE-SCOPED. pi's command registry is static (no
+	// unregister), so they are NOT registered commands at all — this
+	// permanent input handler (registered before the mode handler below)
+	// intercepts them instead: inside a side thread (or with a restored
+	// thread) it consumes them; outside, it lets them pass through, so pi
+	// treats them like any unknown slash text — a plain message. (pi
+	// dispatches REGISTERED extension commands before the input event —
+	// agent-session prompt() — so /qq and /qqro cannot be intercepted
+	// here; their in-mode guard lives in the command handler.)
+	pi.on("input", async (event: InputEvent, ctx) => {
+		const c = ctx as ExtensionCommandContext;
+		if (event.source !== "interactive") return { action: "continue" };
+		const text = event.text.trim();
+		if (text === "/ro" || text.startsWith("/ro ")) {
+			if (!sideMode) return { action: "continue" };
 			followUpPolicy = followUpPolicy === "ro" ? "none" : "ro";
-			ctx.ui.notify(
+			c.ui.notify(
 				followUpPolicy === "ro"
 					? "Follow-ups are now read-only (read, grep, find, ls)."
 					: "Follow-ups are back to no tools.",
 			);
-			ctx.ui.setStatus("qq", modeStatus());
-		},
-	});
-
-	pi.registerCommand("nvm", {
-		description: "Side thread: never mind — drop the whole side thread and return to the main conversation",
-		handler: async (_args: string, ctx: ExtensionCommandContext) => {
-			if (!sideMode && !thread.root) {
-				ctx.ui.notify("No side thread to dismiss.", "warning");
-				return;
-			}
+			c.ui.setStatus("qq", modeStatus());
+			return { action: "handled" };
+		}
+		if (text === "/nvm" || text.startsWith("/nvm ")) {
+			if (!sideMode && !thread.root) return { action: "continue" };
 			if (inFlight) {
-				ctx.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
-				return;
+				c.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
+				return { action: "handled" };
 			}
-			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionId = c.sessionManager.getSessionId();
 			const root = thread.root && thread.sessionId === sessionId ? thread.root : null;
 			exitMode();
 			if (root) {
 				try {
-					await rewindLeaf(ctx, sessionId, root);
+					await rewindLeaf(c, sessionId, root);
 					thread.root = null;
 					thread.sessionId = null;
-					ctx.ui.notify("Side thread dismissed — you're back on the main conversation.", "info");
+					c.ui.notify("Side thread dismissed — you're back on the main conversation.", "info");
 				} catch (err) {
 					// Keep the thread state so /qq + any key can retry the rewind.
-					ctx.ui.notify(
+					c.ui.notify(
 						`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)} — press /qq and hit any key to retry.`,
 						"error",
 					);
@@ -753,8 +795,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 			} else {
 				thread.root = null;
 				thread.sessionId = null;
-				ctx.ui.notify("Back to the main conversation.", "info");
+				c.ui.notify("Back to the main conversation.", "info");
 			}
-		},
+			return { action: "handled" };
+		}
+		return { action: "continue" };
 	});
 }

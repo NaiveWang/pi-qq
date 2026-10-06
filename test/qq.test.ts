@@ -36,13 +36,12 @@ async function toPending(env: Env, cmd: string, question: string): Promise<void>
 // 1. Command surface
 // ---------------------------------------------------------------------------
 
-test("registers /qq, /qqro, /ro, /nvm", () => {
+test("registers /qq and /qqro; /ro and /nvm are input-level (mode-scoped), not commands", () => {
 	const env = makeEnv();
-	for (const name of ["qq", "qqro", "ro", "nvm"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
+	for (const name of ["qq", "qqro"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
+	for (const name of ["ro", "nvm"]) assert.ok(!env.pi.commands.has(name), `/${name} NOT a registered command`);
 	assert.match(env.pi.commands.get("qq")!.description, /f follow-up/);
 	assert.match(env.pi.commands.get("qqro")!.description, /read-only/);
-	assert.match(env.pi.commands.get("ro")!.description, /toggle read-only/);
-	assert.match(env.pi.commands.get("nvm")!.description, /drop the whole side thread/);
 });
 
 test("empty args → usage warning, no session change", async () => {
@@ -166,7 +165,8 @@ test("f + follow-up + dismiss removes the WHOLE thread", async () => {
 	env.ctx.press("f");
 	await p1;
 
-	const p2 = await toPending(env, "qq", "q2");
+	const p2 = submitInput(env, "q2");
+	await waitFor(() => isPending(env), "PENDING for q2");
 	env.ctx.press("x");
 	await p2;
 	await waitFor(() => env.session.leafId === root, "thread rewound to its root");
@@ -180,10 +180,16 @@ test("thread grows across multiple follow-ups, merge keeps everything in order",
 	const p1 = await toPending(env, "qq", "q1");
 	env.ctx.press("f");
 	await p1;
-	const p2 = await toPending(env, "qqro", "q2");
+	// In a live thread /qq and /qqro are hidden (and declined if typed) —
+	// follow-ups are plain text; /ro steers the label to qqro.
+	await submitInput(env, "/ro");
+	const p2 = submitInput(env, "q2");
+	await waitFor(() => isPending(env), "PENDING for q2");
 	env.ctx.press("f");
 	await p2;
-	const p3 = await toPending(env, "qq", "q3");
+	await submitInput(env, "/ro"); // toggle back to no-tools
+	const p3 = submitInput(env, "q3");
+	await waitFor(() => isPending(env), "PENDING for q3");
 	env.ctx.press("m");
 	await p3;
 
@@ -201,7 +207,7 @@ test("follow-up's context includes the earlier side Q&A", async () => {
 	await p1;
 	const leafAfterQ1 = env.session.leafId!;
 
-	const p2 = run(env, "qq", "q2");
+	const p2 = submitInput(env, "q2");
 	await waitFor(() => env.pi.sentMessages.length === 2, "q2 sent");
 	const q2Entry = env.session.findUserEntry("qq: q2");
 	assert.ok(q2Entry, "q2 user entry exists");
@@ -233,12 +239,16 @@ test("real turn outside the mode absorbs the thread; next /qq starts fresh", asy
 
 	// The next /qq detects the absorption: FRESH thread, and the mode ends.
 	const p2 = await toPending(env, "qq", "q3");
-	assert.deepEqual(await submitInput(env, "x"), [], "mode ended by the absorption");
-	env.ctx.press("x");
+	env.ctx.press("x"); // dismiss the q3 probe
 	await p2;
 	await waitFor(() => env.session.leafId === realAnswer.id, "rewound only the new question");
 	assert.ok(env.session.findUserEntry("qq: q1"), "absorbed Q&A stays");
 	assert.ok(env.session.branch().some((e) => e.message?.content === "a real question"), "real turn stays");
+
+	// The mode is over: plain input is no longer hijacked. (During PENDING
+	// the editor is not deliverable — the terminal owns the input — so this
+	// is checked AFTER the keypress.)
+	assert.equal(await submitInput(env, "back to work"), "message", "mode ended by the absorption");
 });
 
 // ---------------------------------------------------------------------------
@@ -274,7 +284,7 @@ test("/ro toggles the follow-up policy on and off (f does not reset it)", async 
 	env.ctx.press("f");
 	await p1;
 
-	await run(env, "ro", "");
+	await submitInput(env, "/ro");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("read-only")));
 	const p2 = submitInput(env, "q2");
 	await waitFor(() => isPending(env), "PENDING for q2");
@@ -282,7 +292,7 @@ test("/ro toggles the follow-up policy on and off (f does not reset it)", async 
 	env.ctx.press("f"); // stay in the thread — policy must NOT reset
 	await p2;
 
-	await run(env, "ro", "");
+	await submitInput(env, "/ro");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("back to no tools")));
 	const p3 = submitInput(env, "q3");
 	await waitFor(() => isPending(env), "PENDING for q3");
@@ -291,10 +301,10 @@ test("/ro toggles the follow-up policy on and off (f does not reset it)", async 
 	await p3;
 });
 
-test("/ro outside a side thread warns", async () => {
+test("/ro outside a side thread is NOT a command (passes through as a message)", async () => {
 	const env = makeEnv();
-	await run(env, "ro", "");
-	assert.ok(env.ctx.notifyOf((m) => m.includes("Not in a side thread")));
+	assert.equal(await submitInput(env, "/ro"), "message", "not consumed, not a registered command");
+	assert.equal(env.ctx.notifs.length, 0, "no warning — it just goes to the model");
 });
 
 test("/nvm drops the whole thread and returns to the main conversation", async () => {
@@ -309,23 +319,22 @@ test("/nvm drops the whole thread and returns to the main conversation", async (
 	env.ctx.press("f"); // editor free, nothing in flight
 	await p2;
 
-	await run(env, "nvm", "");
+	await submitInput(env, "/nvm");
 	await waitFor(() => env.session.leafId === root, "rewound to the thread root");
 	assert.deepEqual(
 		env.session.branch().filter((e) => e.message?.role === "user").map((e) => e.message!.content),
 		["main question"],
 		"both side Q&As gone",
 	);
-	assert.deepEqual(await submitInput(env, "back to work"), [], "mode off: plain input no longer hijacked");
+	assert.equal(await submitInput(env, "back to work"), "message", "mode off: plain input no longer hijacked");
 	assert.equal(env.ctx.editorComponent, undefined, "editor restored");
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
 });
 
-test("/nvm with no thread warns and changes nothing", async () => {
+test("/nvm with no thread is NOT a command (passes through as a message)", async () => {
 	const env = makeEnv();
-	await run(env, "nvm", "");
-	assert.ok(env.ctx.notifyOf((m) => m.includes("No side thread")));
-	assert.equal(env.pi.sentMessages.length, 0);
+	assert.equal(await submitInput(env, "/nvm"), "message", "not consumed, not a registered command");
+	assert.equal(env.ctx.notifs.length, 0, "no warning — it just goes to the model");
 });
 
 test("/nvm while a side question is in flight warns and does not rewind", async () => {
@@ -337,7 +346,7 @@ test("/nvm while a side question is in flight warns and does not rewind", async 
 
 	const p2 = submitInput(env, "q2");
 	await waitFor(() => env.pi.sentMessages.length === 2, "q2 sent");
-	await run(env, "nvm", ""); // in flight → refuses
+	await submitInput(env, "/nvm"); // in flight → refuses
 	assert.ok(env.ctx.notifyOf((m) => m.includes("in flight")));
 	assert.notEqual(env.session.leafId, root, "nothing rewound while in flight");
 
@@ -353,7 +362,7 @@ test("session_compact in mode exits the mode (thread absorbed)", async () => {
 	await p1;
 
 	env.pi.emit("session_compact", { type: "session_compact" });
-	assert.deepEqual(await submitInput(env, "x"), [], "plain input no longer hijacked");
+	assert.equal(await submitInput(env, "x"), "message", "plain input no longer hijacked");
 	assert.equal(env.ctx.editorComponent, undefined, "editor restored");
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "mode subscriptions cleaned up");
 });
@@ -365,7 +374,7 @@ test("session_tree navigation in mode exits the mode", async () => {
 	await p1;
 
 	env.pi.emit("session_tree", { type: "session_tree", newLeafId: "e1", oldLeafId: "e2" });
-	assert.deepEqual(await submitInput(env, "x"), [], "navigation ended the mode");
+	assert.equal(await submitInput(env, "x"), "message", "navigation ended the mode");
 });
 
 test("session_start (new/fork) in mode exits the mode", async () => {
@@ -380,7 +389,7 @@ test("session_start (new/fork) in mode exits the mode", async () => {
 	env.ctx.sessionManager = fresh;
 	env.pi.session = fresh;
 	env.pi.emit("session_start", { type: "session_start", reason: "new" });
-	assert.deepEqual(await submitInput(env, "x"), [], "session change ended the mode");
+	assert.equal(await submitInput(env, "x"), "message", "session change ended the mode");
 });
 
 test("extension-source input is never hijacked (recursion guard)", async () => {
@@ -391,30 +400,43 @@ test("extension-source input is never hijacked (recursion guard)", async () => {
 
 	// Our own side messages arrive via sendUserMessage → source "extension".
 	const res = await submitInput(env, "x", "extension");
-	assert.deepEqual(res, [{ action: "continue" }], "extension input passes through");
-	assert.equal(env.pi.sentMessages.length, 1, "nothing new was sent");
+	assert.equal(res, "message", "extension input passes through");
+	assert.equal(env.pi.sentMessages[1], "x", "NOT hijacked into a side question");
 
-	// The mode is still active for interactive input.
+	// A real (unlabeled) turn landed: the thread is absorbed, so the next
+	// interactive input is a real message too — the mode cannot outlive
+	// its thread.
+	assert.equal(await submitInput(env, "q2"), "message", "absorbed thread: mode over");
+});
+
+test("/qq inside a live thread is hidden AND not dispatched", async () => {
+	const env = makeEnv({ answer: "a" });
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+
+	assert.equal(await submitInput(env, "/qq"), "command", "dispatched, but the handler declines in-mode");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("Already in the side thread")));
+	assert.equal(env.pi.sentMessages.length, 1, "nothing new sent");
+
+	// The mode is still active for plain input.
 	const p2 = submitInput(env, "q2");
 	await waitFor(() => isPending(env), "PENDING");
 	env.ctx.press("m");
 	await p2;
 });
 
-test("slash input in mode passes through; the mode stays active", async () => {
+test("unknown slash input in mode becomes a real message (absorbs the thread)", async () => {
 	const env = makeEnv({ answer: "a" });
 	const p1 = await toPending(env, "qq", "q1");
 	env.ctx.press("f");
 	await p1;
 
 	const res = await submitInput(env, "/xyz");
-	assert.deepEqual(res, [{ action: "continue" }], "unknown command passes through");
+	assert.equal(res, "message", "unknown command passes through to the model");
 
-	const p2 = submitInput(env, "q2");
-	await waitFor(() => isPending(env), "PENDING");
-	assert.ok(env.pi.sentMessages[1].startsWith("qq: q2"), "mode still active");
-	env.ctx.press("m");
-	await p2;
+	// A real turn landed: the thread is absorbed, the mode is over.
+	assert.equal(await submitInput(env, "q2"), "message", "mode over after absorption");
 });
 
 test("plain input while a side question is in flight warns and is dropped", async () => {
@@ -426,7 +448,7 @@ test("plain input while a side question is in flight warns and is dropped", asyn
 	const p2 = submitInput(env, "q2");
 	await waitFor(() => env.pi.sentMessages.length === 2, "q2 sent");
 	const res = await submitInput(env, "q3");
-	assert.deepEqual(res, [{ action: "handled" }], "consumed, not queued");
+	assert.equal(res, "consumed", "consumed, not queued");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("already in flight")));
 
 	await waitFor(() => isPending(env), "PENDING for q2");
@@ -448,21 +470,21 @@ test("full mode loop: /qq → f → type → f → /ro → type → /nvm", async
 	env.ctx.press("f");
 	await p2;
 
-	await run(env, "ro", "");
+	await submitInput(env, "/ro");
 	const p3 = submitInput(env, "q3");
 	await waitFor(() => isPending(env), "PENDING for q3");
 	assert.ok(env.pi.sentMessages[2].startsWith("qqro: q3"), "q3 ran read-only");
 	env.ctx.press("f");
 	await p3;
 
-	await run(env, "nvm", "");
+	await submitInput(env, "/nvm");
 	await waitFor(() => env.session.leafId === root, "back at the thread root");
 	assert.deepEqual(
 		env.session.branch().filter((e) => e.message?.role === "user").map((e) => e.message!.content),
 		["main question"],
 		"whole thread gone",
 	);
-	assert.deepEqual(await submitInput(env, "back to work"), [], "mode off");
+	assert.equal(await submitInput(env, "back to work"), "message", "mode off");
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
 });
 
@@ -485,15 +507,15 @@ test("session_start registers the autocomplete filter exactly once", async () =>
 	assert.equal(env.ctx.autocompleteFactories.length, 1, "wrapped once");
 });
 
-test("autocomplete hides /ro and /nvm outside the thread, /qq and /qqro inside", async () => {
+test("autocomplete hides /qq and /qqro inside the thread (/ro, /nvm are not commands)", async () => {
 	const env = makeEnv({ answer: "a" });
 	env.pi.emit("session_start", { type: "session_start", reason: "startup" });
 	const wrapped = env.ctx.autocompleteFactories[0](
+		// pi's provider only lists REGISTERED commands — /ro and /nvm are
+		// not among them (the input handler owns them instead).
 		fakeProvider([
 			{ value: "qq", label: "qq" },
 			{ value: "qqro", label: "qqro" },
-			{ value: "ro", label: "ro" },
-			{ value: "nvm", label: "nvm" },
 			{ value: "compact", label: "compact" },
 		]),
 	) as {
@@ -501,7 +523,7 @@ test("autocomplete hides /ro and /nvm outside the thread, /qq and /qqro inside",
 	};
 	const sig = { signal: new AbortController().signal };
 
-	// Outside the thread: /ro and /nvm hidden, the rest visible.
+	// Outside the thread: everything registered is visible.
 	let s = await wrapped.getSuggestions(["/"], 0, 1, sig);
 	assert.deepEqual(s!.items.map((i) => i.value), ["qq", "qqro", "compact"]);
 
@@ -510,7 +532,7 @@ test("autocomplete hides /ro and /nvm outside the thread, /qq and /qqro inside",
 	env.ctx.press("f");
 	await p;
 	s = await wrapped.getSuggestions(["/"], 0, 1, sig);
-	assert.deepEqual(s!.items.map((i) => i.value), ["ro", "nvm", "compact"]);
+	assert.deepEqual(s!.items.map((i) => i.value), ["compact"]);
 });
 
 test("the editor top border carries the side-thread title in mode only", async () => {
@@ -530,7 +552,7 @@ test("the editor top border carries the side-thread title in mode only", async (
 	assert.ok(border.includes("qq side thread"), "border carries the mode title");
 	assert.ok(border.includes("/nvm back to main"));
 
-	await run(env, "nvm", "");
+	await submitInput(env, "/nvm");
 	assert.equal(env.ctx.editorComponents.at(-1), undefined, "editor restored after /nvm");
 });
 
@@ -590,12 +612,13 @@ test("failed question mid-thread keeps the thread alive", async () => {
 
 	// q2 fails (no answer) → only q2 is discarded.
 	env.behavior.answer = null;
-	await run(env, "qq", "q2");
+	await submitInput(env, "q2");
 	await waitFor(() => !!env.session.findUserEntry("qq: q1") && !env.session.findUserEntry("qq: q2"), "q2 discarded, q1 survives");
 
 	// Thread still alive: q3 succeeds, and dismissing it removes the WHOLE thread.
 	env.behavior.answer = "a3";
-	const p3 = await toPending(env, "qq", "q3");
+	const p3 = submitInput(env, "q3");
+	await waitFor(() => isPending(env), "PENDING for q3");
 	env.ctx.press("x");
 	await p3;
 	await waitFor(() => env.session.leafId === root, "whole thread rewound");
@@ -695,7 +718,7 @@ test("no leaked subscriptions: merge, dismiss, no-answer, and mode exit", async 
 	p = await toPending(env, "qq", "q");
 	env.ctx.press("f");
 	await p;
-	await run(env, "nvm", "");
+	await submitInput(env, "/nvm");
 	await waitFor(() => env.pi.activeCount() === env.pi.baselineActive, "no leaks after mode exit");
 });
 
@@ -853,7 +876,7 @@ test("resume does NOT re-open a MERGED thread (close marker at the leaf)", async
 	await p1;
 	env.pi.emit("session_start", { reason: "resume" });
 	assert.equal(env.ctx.editorComponent, undefined, "no mode: the thread was merged");
-	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+	assert.equal(await submitInput(env, "hello"), "message", "plain input not hijacked");
 });
 
 test("resume does NOT re-open an ABSORBED thread (normal message after the Q&A)", async () => {
@@ -866,7 +889,7 @@ test("resume does NOT re-open an ABSORBED thread (normal message after the Q&A)"
 	env.session.add("message", { role: "assistant", content: [{ type: "text", text: "ok" }] });
 	env.pi.emit("session_start", { reason: "resume" });
 	assert.equal(env.ctx.editorComponent, undefined, "no mode");
-	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+	assert.equal(await submitInput(env, "hello"), "message", "plain input not hijacked");
 });
 
 test("resume with an UNANSWERED trailing question restores the thread without the mode", async () => {
@@ -882,7 +905,7 @@ test("resume with an UNANSWERED trailing question restores the thread without th
 	assert.equal(env.ctx.editorComponent, undefined, "no mode (nothing to follow up on)");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("without an answer")));
 	// /nvm can still drop the whole thread.
-	await run(env, "nvm", "");
+	await submitInput(env, "/nvm");
 	await waitFor(() => env.session.leafId === root, "dropped back to the thread root");
 });
 
@@ -890,5 +913,5 @@ test("resume of a plain session (no side markers) does nothing", async () => {
 	const env = makeEnv();
 	env.pi.emit("session_start", { reason: "resume" });
 	assert.equal(env.ctx.editorComponent, undefined);
-	assert.deepEqual(await submitInput(env, "hello"), [], "plain input not hijacked");
+	assert.equal(await submitInput(env, "hello"), "message", "plain input not hijacked");
 });
