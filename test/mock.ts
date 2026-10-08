@@ -191,8 +191,9 @@ export const isPending = (env: Env): boolean => env.ctx.terminal.size > 0;
  *     consumes it);
  *  3. otherwise it becomes a plain model message (what pi does with unknown
  *     slash text too).
- * NOTE: while the side thread is open, a plain-text submission resolves only
- * AFTER the resulting side question reaches its keypress — fire it
+ * NOTE: in side-thread mode a plain-text submission resolves when the
+ * resulting side ANSWER settles — there is no keypress to press. For the
+ * first answer (no mode yet) it resolves at the keypress instead: fire it
  * (const p = submitInput(...)), wait for PENDING, press, then await p.
  */
 export async function submitInput(

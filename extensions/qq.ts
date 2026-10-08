@@ -21,14 +21,16 @@
  *       execute during a side question.
  *
  * The Q&A takes over the main transcript like a normal turn. It STAYS there —
- * read it in place at your own pace. After EVERY side answer, the first
- * keypress decides:
+ * read it in place at your own pace. The FIRST side answer ends in a
+ * keypress choice:
  *
  *   f    → side-thread mode: the side branch stays and the input goes back
  *          to you. From now on, PLAIN TEXT in the editor runs as the next
  *          side question (no /qq needed); /ro toggles the tool policy;
- *          /nvm drops the whole thread. Every side answer ends in the same
- *          f / m / dismiss choice again.
+ *          /nvm drops the whole thread. Inside the mode there is NO
+ *          keypress after a follow-up answer — it just stays on the branch
+ *          and you keep typing follow-ups until /nvm (or a real turn
+ *          absorbs the thread).
  *   m    → MERGE: no rewind — the whole thread becomes part of the
  *          conversation and the next message continues right after it.
  *   any  → DISMISS: the WHOLE side thread (every question and answer in
@@ -70,12 +72,17 @@
  *      agent streams the answer inline. Subscribe to agent_settled BEFORE
  *      sending (it is the final boundary: retries, auto-compaction and
  *      queued continuations are all done).
- *   3. On settled, if an assistant reply exists: enter PENDING state —
- *      footer status + notification tell you the choices. The first terminal
- *      keypress decides: m merges (no rewind), f opens the side thread,
- *      any other key dismisses (rewinds the whole thread to its root).
- *      Dismissal consumes control keys and passes printable characters
- *      through, so you can start typing your next prompt immediately.
+ *   3. On settled, if an assistant reply exists: enter PENDING state.
+ *      - First answer (no mode yet): footer status + notification tell you
+ *        the choices. The first terminal keypress decides: m merges (no
+ *        rewind), f opens the side thread, any other key dismisses (rewinds
+ *        the whole thread to its root). Dismissal consumes control keys and
+ *        passes printable characters through, so you can start typing your
+ *        next prompt immediately.
+ *      - Follow-up answer (mode active): NO keypress — the answer stays on
+ *        the branch, a status + notification point at the input box, and
+ *        the next plain text is simply the next follow-up. (A single-key
+ *        gate would eat the first character of whatever you type.)
  *   4. If no assistant reply was produced (aborted before answering), rewind
  *      immediately — nothing to read.
  *
@@ -305,6 +312,8 @@ interface ModeCtl {
 	enter: (ctx: ExtensionCommandContext) => void;
 	/** Leave mode: clears the status and removes ALL mode subscriptions. */
 	exit: () => void;
+	/** True while the side thread is open (plain text = follow-up). */
+	active: () => boolean;
 }
 
 /**
@@ -535,7 +544,20 @@ async function runInline(
 		return;
 	}
 
-	// PENDING: the answer sits in the transcript. Wait for a keypress.
+	// PENDING: the answer sits in the transcript.
+	if (mode.active()) {
+		// Side-thread mode: NO keypress gate. The answer stays on the branch
+		// and the input box is already yours — just type the next follow-up
+		// (it is hijacked into a side question). The thread ends with /nvm
+		// (drop), when a real turn absorbs it, or (later) /merge. A
+		// single-key "m" gate is impossible in mode: the first character of
+		// a message starting with "m" would merge, and any other character
+		// would drop the whole thread.
+		ctx.ui.setStatus(label, "side answer ready — type a follow-up · /nvm back to main");
+		ctx.ui.notify(`${label} side answer ready — just type the next follow-up (/nvm drops the thread).`, "info");
+		return;
+	}
+	// First answer (no mode yet): wait for a keypress.
 	if (typeof ctx.ui.onTerminalInput !== "function") {
 		// Non-interactive mode: can't wait — discard this question now.
 		try {
@@ -758,7 +780,7 @@ export default function qqExtension(pi: ExtensionAPI) {
 		];
 	}
 
-	const modeCtl: ModeCtl = { enter: enterMode, exit: exitMode };
+	const modeCtl: ModeCtl = { enter: enterMode, exit: exitMode, active: () => sideMode };
 
 	// The slash-command list is static (pi has no unregister), so the mode is
 	// reflected in the AUTOCOMPLETE surface instead: while the side thread is
@@ -791,9 +813,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 		// none) — but the thread itself lives in the session file. If the
 		// branch ends in side Q&A, the user exited pi mid-thread: re-anchor
 		// the thread. An ANSWERED thread re-enters the mode (plain text
-		// resumes the follow-up; /nvm drops it; m after an answer keeps it);
-		// an unanswered one (exited mid-stream) only restores the thread
-		// state so /nvm can still drop it.
+		// resumes the follow-up; /nvm drops it; every follow-up answer just
+		// stays on the branch until then); an unanswered one (exited
+		// mid-stream) only restores the thread state so /nvm can still drop
+		// it.
 		const found = detectSideThreadRoot(c.sessionManager.getBranch() as QqBranchEntry[]);
 		if (found) {
 			exitMode();
@@ -802,7 +825,7 @@ export default function qqExtension(pi: ExtensionAPI) {
 			if (found.answered) {
 				enterMode(c);
 				c.ui.notify(
-					"Resumed the side thread you left open — type a follow-up · /ro read-only · /nvm drops it · m after an answer keeps it.",
+					"Resumed the side thread you left open — type a follow-up · /ro read-only · /nvm drops it.",
 					"info",
 				);
 			} else {
@@ -901,9 +924,16 @@ export default function qqExtension(pi: ExtensionAPI) {
 				// decline with a pointer at what plain text already does. (If
 				// the thread has already been absorbed, /qq is the cleanup path
 				// — let it run.)
-				if (sideMode && threadAlive(ctx.sessionManager)) {
-					ctx.ui.notify("Already in the side thread — just type the follow-up (or /nvm to leave).", "info");
-					return;
+				if (sideMode) {
+					if (threadAlive(ctx.sessionManager)) {
+						ctx.ui.notify("Already in the side thread — just type the follow-up (or /nvm to leave).", "info");
+						return;
+					}
+					// The thread was absorbed OUT-OF-BAND (e.g. an rpc driver
+					// sent a real turn) — the mode cannot outlive its thread:
+					// end the stale mode so this FRESH /qq gets the normal
+					// first-answer keypress choices (m / f / dismiss).
+					exitMode();
 				}
 				const question = args.trim();
 				if (!question) {
