@@ -8,6 +8,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { MockSession, MockCtx } from "./types.ts";
+import type { MockEntry } from "./types.ts";
 import qqExtension from "../extensions/qq.ts";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ export class MockPi {
 		this.appended.push({ type, data });
 		const e = this.session.add("custom", undefined);
 		e.customType = type;
+		e.data = data as NonNullable<MockEntry["data"]>;
 	}
 
 	/** pi.sendUserMessage: appends the user entry, then simulates the agent run. */
