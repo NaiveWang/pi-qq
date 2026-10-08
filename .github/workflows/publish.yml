@@ -17,4 +17,10 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run typecheck
-      - run: npm publish --provenance
+      - run: |
+          npm publish --provenance
+          # The self-patch lives on main since 0.4.0 (the old
+          # patched-core-0.2.x line is retired). Keep the legacy `patched`
+          # dist-tag on this same build so existing `@patched` installs
+          # keep receiving the fixed, pruning build.
+          npm dist-tag add "@elvinw/pi-qq@$(node -p 'require("./package.json").version')" patched

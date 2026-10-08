@@ -3,6 +3,39 @@
 Ask a one-off "by the way" question **without letting the Q&A enter the ongoing
 context** — the same idea as Claude Code's `/btw`.
 
+## True deletion: dismissed threads are really gone
+
+Mainline pi's session is append-only: dismissing a `/qq` thread can at best
+move the leaf back, leaving the Q&A as a **dead branch** in the file (visible
+in `/tree`). This extension closes that gap. At load time it **additively
+installs** `pruneBranches(keepLeafId?)` on `SessionManager.prototype` —
+keeping only the root→leaf path, rebuilding pi's own index, and rewriting the
+session file. Never overriding an existing method, and only when the running
+pi version **exactly** matches the pin (`config.patchTargetPiVersion`,
+currently **1.1.0** — the patch touches private-by-convention internals that
+may drift on any release).
+
+Dismiss and `/nvm` then drop the thread through a ladder — the first tier
+that works wins:
+
+1. **prune** (pin matches the running pi): the thread is physically removed
+   from the session file — no dead branch, same session id. (Other orphan
+   branches are tidied too.)
+2. **rewind** (any other pi): the baseline — the thread is orphaned in the
+   tree (visible in `/tree`). There is deliberately **no fork tier**: a
+   fork would create a *duplicate session file* in `/resume` on every
+   dismiss. A one-time notice makes the degradation visible.
+
+Transient failure paths (no answer, timeouts) still use a plain rewind:
+they discard one small failed question and must not churn session files.
+
+> **Good to know:** the prune tier **rewrites your session files in place**
+> (the thread's nodes are removed from the JSONL). The patch itself is
+> in-memory only and additive — it refuses to install on any pi other than
+> the exact pinned one, and **uninstalling the extension leaves pi
+> completely untouched**. Still, if you run valuable sessions, keep your
+> usual `~/.pi` backups.
+
 ## Commands
 
 | Command | Tool policy during the question |
@@ -71,14 +104,15 @@ context is always built from the root→leaf path. `/qq` exploits that:
 2. Waits for the run to fully settle (`agent_settled`).
 3. Puts up "any key dismisses · m merges" (footer status + notification) and
    waits for **your** keypress.
-4. On dismiss, **snaps the leaf back** to the thread's root — the leaf before
-   the thread's first question, so a whole follow-up thread vanishes in one
-   keypress (same mechanism as `/tree`). On merge, it simply doesn't rewind.
+4. On dismiss, **drops the thread at its root** — the leaf before the
+   thread's first question, so a whole follow-up thread vanishes in one
+   keypress — via the first available tier: prune (exact pi match) → leaf
+   rewind (any other pi). On merge, it simply doesn't rewind.
 
 After a dismiss the exchange is excluded from all future model requests and
-compaction — but it remains in the session file as a dead branch, visible in
-`/tree` (you can re-attach it later by navigating to it). Nothing is copied or
-deleted; pi never rewrites history.
+compaction. With the self-patch active it is also physically removed from the
+session file; on any other pi it remains as a dead branch, visible in `/tree`
+(you can re-attach it later by navigating to it).
 
 ## Compaction safety
 
@@ -106,6 +140,10 @@ the recurring cost — the exchange never rides along in every subsequent turn.
 pi install npm:@elvinw/pi-qq
 ```
 
+Works on any pi: on pi **1.1.0** exactly, dismissed threads are physically
+pruned from the session file (see above); on other pi versions the extension
+automatically degrades to the plain dead-branch behavior.
+
 or from a local clone:
 
 ```bash
@@ -122,13 +160,15 @@ when it loads the extension.
 ## Development
 
 ```bash
-npm install        # pulls the published pi-coding-agent 1.0.2 types + tsc
+npm install        # pulls the published pi-coding-agent 1.1.0 types + tsc
 npm run typecheck
-npm test           # 48 scenario tests (node:test, no extra deps)
+npm test           # 57 scenario tests (node:test, no extra deps)
 ```
 
-The `pi-coding-agent` dev-dependency exists purely for local typechecking
-against the published API; `node_modules/` is git-ignored.
+The `pi-coding-agent` dev-dependency is **exactly pinned** (no `^`) because
+the self-patch — and the tests around it — target one specific pi version;
+it also exists for local typechecking against the published API.
+`node_modules/` is git-ignored.
 
 ### Tests
 
@@ -159,6 +199,11 @@ needed). The scenario matrix covers:
   (follow-up continues, dismiss drops the whole thread), merged/absorbed
   threads are not re-opened, unanswered (mid-stream) restore only the
   thread for `/nvm`, plain sessions untouched
+- **true deletion** — `installSessionPrune` on the exact pinned pi version
+  (idempotent, version-mismatch refusal) and a real `SessionManager`
+  integration test (prune keeps root→target, re-pins the leaf, rewrites the
+  file, reopens cleanly); the drop ladder on dismiss and `/nvm`
+  (prune / rewind tiers — never fork)
 
 ## Safety
 

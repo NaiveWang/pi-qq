@@ -11,11 +11,17 @@
  *  7. Queue (busy agent)
  *  8. Safety invariants (leaks, compaction, tool guardrail, session swaps)
  *  9. Preflight
+ * 10. Resume (pi exited mid-thread → session_start re-anchors the follow-up)
+ * 11. True deletion: pruneBranches self-patch + drop ladder
  */
 
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { config } from "../extensions/qq.ts";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { config, installSessionPrune } from "../extensions/qq.ts";
 import { makeEnv, run, waitFor, externalRun, isPending, submitInput, type Env } from "./mock.ts";
 import { MockSession } from "./types.ts";
 
@@ -78,7 +84,7 @@ test("happy path: marker + labeled message, PENDING, dismiss rewinds to homeLeaf
 	// Dismiss → rewind to homeLeaf.
 	env.ctx.press("x");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
-	assert.ok(env.ctx.notifyOf((m) => m.includes("dismissed")));
+	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed")));
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
 });
 
@@ -811,7 +817,7 @@ test("rewind waits for idle; stuck-busy fails loud without crashing", async () =
 	env.ctx.idle = false; // stuck
 	env.ctx.press("x");
 	await p2;
-	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("rewind failed")), "fail-loud notification");
+	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("dismiss failed")), "fail-loud notification");
 	assert.notEqual(env.session.leafId, homeLeafB, "nothing was rewound");
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive);
 });
@@ -914,4 +920,124 @@ test("resume of a plain session (no side markers) does nothing", async () => {
 	env.pi.emit("session_start", { reason: "resume" });
 	assert.equal(env.ctx.editorComponent, undefined);
 	assert.equal(await submitInput(env, "hello"), "message", "plain input not hijacked");
+});
+
+// ---------------------------------------------------------------------------
+// 11. True deletion: pruneBranches self-patch + drop ladder
+// ---------------------------------------------------------------------------
+
+test("installSessionPrune installs on the exact pinned pi version", () => {
+	const status = installSessionPrune();
+	assert.equal(status.installed, true, `install failed: ${status.reason}`);
+	assert.equal(typeof (SessionManager.prototype as unknown as { pruneBranches?: unknown }).pruneBranches, "function");
+});
+
+test("installSessionPrune is idempotent (an existing method is never overridden)", () => {
+	installSessionPrune();
+	const status = installSessionPrune();
+	assert.equal(status.installed, true);
+	assert.equal(status.native, true, "second run sees the method and stands down");
+});
+
+test("installSessionPrune refuses a version mismatch", () => {
+	const prev = config.patchTargetPiVersion;
+	config.patchTargetPiVersion = "9.9.9";
+	try {
+		const status = installSessionPrune();
+		assert.equal(status.installed, false);
+		assert.match(status.reason ?? "", /9\.9\.9/);
+	} finally {
+		config.patchTargetPiVersion = prev;
+	}
+});
+
+test("pruneBranches keeps only root→target, re-pins the leaf, and rewrites the file", () => {
+	installSessionPrune();
+	const dir = mkdtempSync(join(tmpdir(), "qq-prune-"));
+	try {
+		const sm = SessionManager.create("/tmp", dir);
+		const user = sm.appendMessage({ role: "user", content: "main q", timestamp: Date.now() });
+		const a = sm.appendCustomEntry("a");
+		const b = sm.appendCustomEntry("b"); // the side-thread node (to be pruned)
+		sm.branch(a); // leaf back to a — like a dismissed /qq
+		const c = sm.appendCustomEntry("c"); // mainline continues
+		// Prune keeping root→a (the thread root), NOT the current leaf:
+		const removed = (sm as unknown as { pruneBranches: (keepLeafId?: string) => number }).pruneBranches(a);
+		assert.equal(removed, 2, "b and c removed (c was off the kept path)");
+		assert.equal(sm.getEntry(b), undefined, "thread node gone from the index");
+		assert.equal(sm.getEntry(c), undefined, "post-leaf entry gone");
+		assert.ok(sm.getEntry(a), "kept path intact");
+		assert.equal(sm.getLeafId(), a, "leaf re-pinned to the target");
+		// The FILE on disk was actually rewritten and reopens cleanly:
+		const file = sm.getSessionFile()!;
+		const lines = readFileSync(file, "utf8").trim().split("\n").length;
+		assert.equal(lines, 1 + sm.getEntryCount(), "disk matches in-memory state");
+		const reopened = SessionManager.open(file);
+		assert.equal(reopened.getEntry(b), undefined, "thread node gone from disk");
+		assert.equal(reopened.getLeafId(), a, "leaf persisted");
+		assert.ok(reopened.getEntry(user), "mainline intact on reopen");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("dismiss PRUNES the thread when the patch is available (no fork, no rewind)", async () => {
+	const env = makeEnv({ answer: "42" });
+	const homeLeaf = env.session.leafId!;
+	env.session.pruneBranches = (id) => env.session.pruneSim(id); // simulate patched pi
+	await toPending(env, "qq", "q?");
+	env.ctx.press("x");
+	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
+	assert.deepEqual(env.session.pruneCalls, [homeLeaf], "pruned to the thread root");
+	assert.equal(env.session.leafId, homeLeaf);
+	assert.deepEqual(env.ctx.navigatedTo, [], "no rewind");
+	assert.equal(env.ctx.forkCalls.length, 0, "no fork");
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
+});
+
+test("dismiss REWINDS in place when the patch is absent — even if ctx.fork exists (never fork)", async () => {
+	const env = makeEnv({ answer: "42" });
+	const homeLeaf = env.session.leafId!;
+	env.ctx.installForkSim(); // ctx.fork EXISTS but must not be used —
+	// a fork would create a duplicate session file in /resume per dismiss.
+	await toPending(env, "qq", "q?");
+	env.ctx.press("x");
+	await waitFor(() => env.session.leafId === homeLeaf, "rewound to homeLeaf");
+	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf], "plain in-place rewind");
+	assert.equal(env.ctx.forkCalls.length, 0, "NEVER forks");
+	assert.equal(env.ctx.forkReplacedNotifs.length, 0);
+	assert.deepEqual(env.session.pruneCalls, [], "no prune");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("true deletion is unavailable")), "one-time fallback notice");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed from the conversation")));
+});
+
+test("dismiss REWINDS when neither patch nor fork is available (baseline)", async () => {
+	const env = makeEnv({ answer: "42" });
+	const homeLeaf = env.session.leafId!;
+	await toPending(env, "qq", "q?"); // unpatched pi: no prune on the mock
+	env.ctx.press("x");
+	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
+	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf]);
+	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed from the conversation")));
+});
+
+test("/nvm PRUNES the whole thread when the patch is available", async () => {
+	const env = makeEnv({ answer: "a" });
+	const root = env.session.leafId!;
+	env.session.pruneBranches = (id) => env.session.pruneSim(id);
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	const p2 = submitInput(env, "q2");
+	await waitFor(() => isPending(env), "PENDING for q2");
+	env.ctx.press("f");
+	await p2;
+	await submitInput(env, "/nvm");
+	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
+	assert.deepEqual(env.session.pruneCalls, [root], "whole thread pruned to the root");
+	assert.deepEqual(
+		env.session.branch().filter((e) => e.message?.role === "user").map((e) => e.message!.content),
+		["main question"],
+		"both side Q&As gone",
+	);
 });
