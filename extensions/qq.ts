@@ -339,6 +339,22 @@ interface ThreadState {
 	forks: number;
 }
 
+/** The mode-scoped commands, for the near-miss check in onModeInput. */
+const MODE_SCOPED_COMMANDS = ["/ro", "/sub", "/merge", "/nvm"] as const;
+
+/**
+ * If `text` is a MISTYPED mode command — it starts with the command token
+ * but is neither the exact command nor "command + space" (e.g. "/nvm'",
+ * "/subx", "/merge!") — return the intended command; otherwise null.
+ * A near-miss is a typo, not a command: in the thread it is just text.
+ */
+function nearMissModeCommand(text: string): string | null {
+	for (const cmd of MODE_SCOPED_COMMANDS) {
+		if (text.startsWith(cmd) && text !== cmd && !text.startsWith(cmd + " ")) return cmd;
+	}
+	return null;
+}
+
 /** Clear all side-thread state (drop target + session + sub-thread count). */
 const clearThread = (t: ThreadState): void => {
 	t.root = null;
@@ -907,9 +923,11 @@ export default function qqExtension(pi: ExtensionAPI) {
 	//  - rpc/extension drivers (a remote caller never meant a side question);
 	//  - slash input: built-ins are handled by pi before prompt() at all;
 	//    /qq and /qqro are registered commands dispatched before this
-	//    event (their in-mode guard lives in the command handler); /ro and
-	//    /nvm are consumed by the permanent input handler (registered
-	//    before this one); anything else passes through untouched.
+	//    event (their in-mode guard lives in the command handler); /ro,
+	//    /sub, /merge and /nvm are consumed by the permanent input handler
+	//    (registered before this one); a MISTYPED mode command ("/nvm'")
+	//    is not a command — it runs as a follow-up question; any other
+	//    unknown slash passes through untouched (a real message).
 	async function onModeInput(event: InputEvent, ctx: unknown): Promise<InputEventResult> {
 		if (!sideMode) return { action: "continue" };
 		if (event.source !== "interactive") return { action: "continue" };
@@ -922,7 +940,18 @@ export default function qqExtension(pi: ExtensionAPI) {
 		}
 		const text = event.text.trim();
 		if (!text) return { action: "handled" }; // never let an empty prompt through in mode
-		if (text.startsWith("/")) return { action: "continue" };
+		if (text.startsWith("/")) {
+			// A near-miss of a mode command ("/nvm'", "/subx") is a typo, not a
+			// command: in the thread the box IS the side conversation, so it
+			// runs as a follow-up question (thread intact). Genuinely unknown
+			// slashes still pass through as real messages — the escape hatch.
+			const near = nearMissModeCommand(text);
+			if (!near) return { action: "continue" };
+			(ctx as ExtensionCommandContext).ui.notify(
+				`"${text}" is not a command — ran it as a follow-up. Type ${near} exactly to run it.`,
+				"info",
+			);
+		}
 		if (!modeCtx) return { action: "continue" };
 		await executeSideQuestion(modeCtx, followUpPolicy === "ro" ? "qqro" : "qq", text, event.images);
 		return { action: "handled" };

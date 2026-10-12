@@ -58,7 +58,10 @@ The side thread is visible everywhere:
   the question now). `/ro`, `/sub`, `/merge` and `/nvm` are not registered
   commands at all — an input-level handler owns them while the thread is
   open, and outside it they pass through to the model as ordinary messages,
-  exactly like any unknown slash text.
+  exactly like any unknown slash text. A **mistyped** mode command
+  (`/nvm'`, `/subx`, …) is a typo, not a command: inside the thread it runs
+  as a follow-up question (the box IS the side conversation), with a note
+  telling you the exact spelling.
 
 Neither command touches the active tool set: the side request is a
 byte-identical prefix extension of your last turn, so on llama.cpp/vLLM it
@@ -86,8 +89,9 @@ choice:
   keypress prompt after a follow-up answer** — it simply stays on the branch
   and you keep typing the next follow-up. The session ends when you run
   `/nvm` (drop it), `/merge` (keep it), or when a normal (non-`/qq`) message
-  lands via another path (rpc driver, unknown slash text, …) — that message
-  absorbs the thread: it can never be rewound away again.
+  lands via another path (rpc driver, genuinely unknown slash text, …) —
+  that message absorbs the thread: it can never be rewound away again.
+  (A mistyped mode command is NOT such a message — see near-miss above.)
 - **exit mid-thread** → the thread survives in the session file. When pi
   next starts on that session, the extension detects that the conversation
   ends in side Q&A and **re-opens the side thread**: an answered one re-
@@ -196,7 +200,10 @@ needed). The scenario matrix covers:
   follow-up answer** (the next plain text is the next follow-up), `/ro`
   toggling (and non-reset across follow-ups), `/nvm` (with and without a
   thread, in-flight guard), auto-exit on `/compact`/`/tree`/`/new` effects,
-  recursion guard, slash pass-through, in-flight guard, full e2e loop
+  recursion guard, slash pass-through, in-flight guard, full e2e loop,
+  **near-miss** (a mistyped mode command like `/nvm'` runs as a follow-up
+  question, thread intact, and passes through as an ordinary message
+  outside the thread)
 - **sub-threads & merge** — `/sub` appends a context-invisible boundary
   (depth shown live in the status and the editor title) and the session
   continues; `/nvm` drops the WHOLE session (initial `/qq` + sub-threads);

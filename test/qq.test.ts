@@ -1287,3 +1287,49 @@ test("/merge after out-of-band absorption is a no-op consume (nothing to merge)"
 	assert.ok(env.session.findUserEntry("real turn"), "real turn intact");
 	assert.equal(env.ctx.editorComponents.at(-1), undefined, "stale mode ended");
 });
+
+test("near-miss of a mode command in mode (\"/nvm'\") runs as a FOLLOW-UP, not a real message", async () => {
+	const env = makeEnv({ answer: "a" });
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	const p2 = submitInput(env, "q2");
+	await waitFor(() => env.pi.sentMessages.length === 2, "q2 sent");
+	await p2;
+
+	// The stray quote makes it NOT a command — in the thread it is just text.
+	const res = await submitInput(env, "/nvm'");
+	assert.equal(res, "consumed", "hijacked by the mode, not sent as a real message");
+	assert.equal(env.pi.sentMessages.length, 3, "ran as a follow-up");
+	assert.equal(env.pi.sentMessages.at(-1)!.split("\n")[0], "qq: /nvm'");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("not a command")), "explained the near-miss");
+	assert.ok(env.session.findUserEntry("qq: q1"), "thread still alive — nothing absorbed");
+	assert.ok(env.ctx.editorComponents.at(-1), "mode still on");
+
+	// The exact command still works and drops the whole session (typo Q&A included).
+	await submitInput(env, "/nvm");
+	await waitFor(() => env.session.findUserEntry("qq: q1") === undefined, "thread dropped");
+});
+
+test("near-misses of /sub and /merge also run as follow-ups in mode (no markers)", async () => {
+	const env = makeEnv({ answer: "a" });
+	const p1 = await toPending(env, "qq", "q1");
+	env.ctx.press("f");
+	await p1;
+	await submitInput(env, "/subx");
+	await submitInput(env, "/merge!");
+	assert.deepEqual(env.pi.sentMessages.slice(1).map((s) => s.split("\n")[0]), ["qq: /subx", "qq: /merge!"]);
+	assert.equal(env.pi.appended.filter((a) => {
+		const d = a.data as { fork?: boolean; closed?: boolean } | undefined;
+		return d?.fork || d?.closed;
+	}).length, 0, "no fork or close markers");
+	assert.ok(env.session.findUserEntry("qq: q1"), "thread intact");
+	assert.ok(env.ctx.editorComponents.at(-1), "mode still on");
+});
+
+test("near-miss OUTSIDE the session is an ordinary message", async () => {
+	const env = makeEnv({ answer: "a" });
+	const res = await submitInput(env, "/nvm'");
+	assert.equal(res, "message", "no session → scope rule: ordinary text");
+	assert.equal(env.pi.sentMessages.at(-1), "/nvm'");
+});
