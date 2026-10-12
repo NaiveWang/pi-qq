@@ -8,6 +8,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { MockSession, MockCtx } from "./types.ts";
+import type { MockEntry } from "./types.ts";
 import qqExtension from "../extensions/qq.ts";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ export class MockPi {
 		this.appended.push({ type, data });
 		const e = this.session.add("custom", undefined);
 		e.customType = type;
+		e.data = data as NonNullable<MockEntry["data"]>;
 	}
 
 	/** pi.sendUserMessage: appends the user entry, then simulates the agent run. */
@@ -191,8 +193,9 @@ export const isPending = (env: Env): boolean => env.ctx.terminal.size > 0;
  *     consumes it);
  *  3. otherwise it becomes a plain model message (what pi does with unknown
  *     slash text too).
- * NOTE: while the side thread is open, a plain-text submission resolves only
- * AFTER the resulting side question reaches its keypress — fire it
+ * NOTE: in side-thread mode a plain-text submission resolves when the
+ * resulting side ANSWER settles — there is no keypress to press. For the
+ * first answer (no mode yet) it resolves at the keypress instead: fire it
  * (const p = submitInput(...)), wait for PENDING, press, then await p.
  */
 export async function submitInput(

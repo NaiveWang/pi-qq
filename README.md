@@ -43,19 +43,25 @@ they discard one small failed question and must not churn session files.
 | `/qq <question>` | prompt asks the model to use **no** tools |
 | `/qqro <question>` | prompt asks the model to use **only** read-only tools (`read`, `grep`, `find`, `ls`) |
 | `/ro` | Side thread **only**: toggle the follow-up policy between no-tools and read-only |
-| `/nvm` | Side thread **only**: **never mind** — exit the mode and rewind the whole thread to its first question, as if it never happened |
+| `/sub` | Side thread **only**: start a **sub-thread** from the current position. It stays part of the SAME side session (a context-invisible boundary marker shows it in `/tree` and on resume); `/nvm` and `/merge` always act on the whole session. (Named `/sub` because pi's built-in `/fork` — fork the *session* — wins the bare `/fork` exact match.) |
+| `/merge` | Side thread **only**: keep **everything** — initial `/qq` + every follow-up + every sub-thread — as conversation. The side session becomes mainline, the mode ends, and the next message continues right after the last answer. |
+| `/nvm` | Side thread **only**: **never mind** — exit the mode and rewind the whole side session (initial `/qq` + follow-ups + sub-threads) to its first question, as if it never happened |
 
 The side thread is visible everywhere:
 
 - **Input box**: while the thread is open, the editor's top border becomes a
-  "qq side thread — … /ro read-only · /nvm back to main" title and the
-  footer status shows the live tool policy.
+  "qq side thread — … /ro read-only · /sub sub-thread · /merge to main · /nvm back"
+  title (live: the sub-thread depth updates on `/sub`) and the footer status
+  shows the live tool policy and depth.
 - **Command list**: hidden == not dispatchable. Inside the thread `/qq` and
   `/qqro` disappear from the list **and do not run either** (plain text is
-  the question now). `/ro` and `/nvm` are not registered commands at all —
-  an input-level handler owns them while the thread is open, and outside it
-  they pass through to the model as ordinary messages, exactly like any
-  unknown slash text.
+  the question now). `/ro`, `/sub`, `/merge` and `/nvm` are not registered
+  commands at all — an input-level handler owns them while the thread is
+  open, and outside it they pass through to the model as ordinary messages,
+  exactly like any unknown slash text. A **mistyped** mode command
+  (`/nvm'`, `/subx`, …) is a typo, not a command: inside the thread it runs
+  as a follow-up question (the box IS the side conversation), with a note
+  telling you the exact spelling.
 
 Neither command touches the active tool set: the side request is a
 byte-identical prefix extension of your last turn, so on llama.cpp/vLLM it
@@ -71,29 +77,36 @@ cache is still intact for the next main turn). Tool policy is two-layer:
 ## How it works
 
 The Q&A takes over the main transcript like a normal turn and **stays there**
-until you decide its fate with your next keypress:
+until you decide its fate. The **first** side answer ends in a keypress
+choice:
 
 - **f** → **open the side thread**: the input box becomes your side
   conversation. **Plain text is the next side question** (answered with the
   whole thread in context, no `/qq` prefix needed). `/ro` toggles the
-  follow-up policy. The mode ends when you: finish with **m** (merge) or
-  any other key (dismiss), run `/nvm` (drop the thread), or when a normal
-  (non-`/qq`) message lands via another path (rpc driver, unknown slash
-  text, …) — that message absorbs the thread: it can never be rewound away
-  again.
+  follow-up policy; `/sub` starts a sub-thread (a boundary within the same
+  session — it does not change what `/nvm` and `/merge` span); `/merge`
+  keeps the whole session as conversation. **Once in the thread there is no
+  keypress prompt after a follow-up answer** — it simply stays on the branch
+  and you keep typing the next follow-up. The session ends when you run
+  `/nvm` (drop it), `/merge` (keep it), or when a normal (non-`/qq`) message
+  lands via another path (rpc driver, genuinely unknown slash text, …) —
+  that message absorbs the thread: it can never be rewound away again.
+  (A mistyped mode command is NOT such a message — see near-miss above.)
 - **exit mid-thread** → the thread survives in the session file. When pi
   next starts on that session, the extension detects that the conversation
   ends in side Q&A and **re-opens the side thread**: an answered one re-
-  enters the mode (type to follow up, `/nvm` drops it, `m` after an answer
-  keeps it); one that was still streaming only restores the thread so
-  `/nvm` can still drop it. A merged thread (its merge left a context-
-  invisible close marker) and an absorbed one are correctly NOT re-opened.
-- **m** → **merge**: the side Q&A becomes part of the conversation and the
-  next message continues right after the answer.
-- **any other key** → **dismiss**: the whole side thread (every question and
-  answer in it) is rewound away and the conversation continues as if it never
-  happened. Printable keys pass through, so you can start typing your next
-  prompt immediately.
+  enters the mode (type to follow up, `/nvm` drops it); one that was still
+  streaming only restores the thread so `/nvm` can still drop it. A merged
+  thread (its merge left a context-invisible close marker) and an absorbed
+  one are correctly NOT re-opened.
+- **m** → **merge** (first answer only): the side Q&A becomes part of the
+  conversation and the next message continues right after the answer. (In
+  the thread, `/merge` is the command-level equivalent — same effect, any
+  time.)
+- **any other key** → **dismiss** (first answer only): the whole side thread
+  (every question and answer in it) is rewound away and the conversation
+  continues as if it never happened. Printable keys pass through, so you can
+  start typing your next prompt immediately.
 
 Mechanically, a pi session is an append-only **tree** of entries and the model
 context is always built from the root→leaf path. `/qq` exploits that:
@@ -102,12 +115,14 @@ context is always built from the root→leaf path. `/qq` exploits that:
    the question (with its tool-policy note) — the Q&A lands on a
    **temporary side branch**.
 2. Waits for the run to fully settle (`agent_settled`).
-3. Puts up "any key dismisses · m merges" (footer status + notification) and
-   waits for **your** keypress.
-4. On dismiss, **drops the thread at its root** — the leaf before the
-   thread's first question, so a whole follow-up thread vanishes in one
-   keypress — via the first available tier: prune (exact pi match) → leaf
-   rewind (any other pi). On merge, it simply doesn't rewind.
+3. First answer: puts up "f follow-up · m merges · any other key
+   dismisses" (footer status + notification) and waits for **your**
+   keypress. Follow-up answer (side thread open): no keypress at all — the
+   answer stays and the input box is already yours.
+4. On dismiss/`/nvm`, **drops the thread at its root** — the leaf before the
+   thread's first question, so a whole follow-up thread vanishes at once —
+   via the first available tier: prune (exact pi match) → leaf rewind (any
+   other pi). On merge, it simply doesn't rewind.
 
 After a dismiss the exchange is excluded from all future model requests and
 compaction. With the self-patch active it is also physically removed from the
@@ -181,14 +196,26 @@ needed). The scenario matrix covers:
   (case, pass-through vs consume), status line, prompt notes
 - **threads** — follow-up chains, context inheritance, thread absorption by
   a normal message, orphaning via `/tree`
-- **side-thread mode** — plain-text follow-ups, `/ro` toggling (and
-  non-reset on `f`), `/nvm` (with and without a thread, in-flight guard),
-  auto-exit on `/compact`/`/tree`/`/new` effects, recursion guard, slash
-  pass-through, in-flight guard, full e2e loop
+- **side-thread mode** — plain-text follow-ups, **no keypress gate after a
+  follow-up answer** (the next plain text is the next follow-up), `/ro`
+  toggling (and non-reset across follow-ups), `/nvm` (with and without a
+  thread, in-flight guard), auto-exit on `/compact`/`/tree`/`/new` effects,
+  recursion guard, slash pass-through, in-flight guard, full e2e loop,
+  **near-miss** (a mistyped mode command like `/nvm'` runs as a follow-up
+  question, thread intact, and passes through as an ordinary message
+  outside the thread)
+- **sub-threads & merge** — `/sub` appends a context-invisible boundary
+  (depth shown live in the status and the editor title) and the session
+  continues; `/nvm` drops the WHOLE session (initial `/qq` + sub-threads);
+  `/merge` keeps the whole chain in order + close marker and ends the mode;
+  both pass through as ordinary messages outside the thread; both are
+  refused while a question is in flight; resume re-enters at the right
+  depth and the walker treats fork boundaries as transparent (unit-tested,
+  incl. merged/absorbed-after-sub and unanswered-after-sub)
 - **mode surface** — autocomplete hides `/qq`+`/qqro` inside the thread and
-  hidden == not dispatched (`/ro` and `/nvm` are input-level, not
-  commands, and pass through as ordinary messages outside the thread);
-  the editor border carries the mode title in mode only
+  hidden == not dispatched (`/ro`, `/sub`, `/merge` and `/nvm` are
+  input-level, not commands, and pass through as ordinary messages outside
+  the thread); the editor border carries the live mode title in mode only
 - **failures** — no answer, settle timeout, failed question mid-thread,
   stuck-busy rewind
 - **queue** — busy-on-call, re-settle loop, queue timeout, in-flight guard
@@ -196,9 +223,9 @@ needed). The scenario matrix covers:
   exit), compaction cancellation, tool guardrail (block/allow matrix),
   session swap, empty session, preflight warning
 - **resume** — pi exited mid-thread: answered thread re-enters the mode
-  (follow-up continues, dismiss drops the whole thread), merged/absorbed
-  threads are not re-opened, unanswered (mid-stream) restore only the
-  thread for `/nvm`, plain sessions untouched
+  (follow-up continues, `/nvm` drops the whole session, incl. sub-threads),
+  merged/absorbed threads are not re-opened, unanswered (mid-stream)
+  restore only the thread for `/nvm`, plain sessions untouched
 - **true deletion** — `installSessionPrune` on the exact pinned pi version
   (idempotent, version-mismatch refusal) and a real `SessionManager`
   integration test (prune keeps root→target, re-pins the leaf, rewrites the
