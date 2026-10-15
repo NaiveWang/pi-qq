@@ -1329,6 +1329,37 @@ test("detectSideThreadRoot: /sub boundaries are transparent; close marker still 
 	);
 });
 
+test("detectSideThreadRoot: real on-disk user messages are content-BLOCK arrays, not strings", () => {
+	// sendUserMessage("qq: ...") is stored by pi as [{ type: "text", text }],
+	// not a plain string. The old string-only isSideUser check matched none of
+	// these, so a real mid-thread resume was never detected and the next plain
+	// message silently absorbed the thread. Regression guard for both shapes.
+	const au = (id: string, text: string) => ({
+		id,
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text }] },
+	});
+	const qm = (id: string) => ({ id, type: "custom", customType: "qq", data: { question: "x" } });
+	const an = (id: string) => ({ id, type: "message", message: { role: "assistant", content: [{ type: "text", text: "a" }] } });
+	const real = (id: string) => ({ id, type: "message", message: { role: "user", content: [{ type: "text", text: "back to work" }] } });
+	const base = [au("m0", "main conversation")];
+
+	// Answered thread, array-content side questions → detected, root at m0.
+	assert.deepEqual(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), qm("4"), au("5", "qq: q2"), an("6")]), {
+		root: "m0",
+		answered: true,
+		forks: 0,
+	});
+	// Unanswered trailing question (exited mid-stream), array content.
+	assert.deepEqual(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), qm("4"), au("5", "qq: q2")]), {
+		root: "m0",
+		answered: false,
+		forks: 0,
+	});
+	// Absorbed: a real (non-qq) ARRAY-content message follows → not resumable.
+	assert.equal(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), real("4")]), null);
+});
+
 test("/nvm after out-of-band absorption does NOT rewind the real turn (stale state)", async () => {
 	const env = makeEnv({ answer: "a" });
 	const p1 = await toPending(env, "qq", "q1");

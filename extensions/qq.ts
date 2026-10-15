@@ -384,19 +384,28 @@ interface ModeCtl {
  * side questions. The first real turn after the thread root absorbs the
  * thread into the conversation — it can never be rewound away again.
  */
+/** Extract the visible text of a user message, whether pi stored the
+ *  content as a plain string or as a block array. sendUserMessage called
+ *  with a string is normalized to [{ type: "text", text }] on disk, so the
+ *  resume detection MUST handle both or it never matches a real session
+ *  (this is what broke mid-thread resume: every real side question is an
+ *  array, so the string-only check saw no side Q&A to re-anchor on). */
+function userMessageText(content: unknown): string {
+	return typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? (content as { type?: string; text?: string }[])
+					.filter((x) => x?.type === "text")
+					.map((x) => x.text ?? "")
+					.join(" ")
+			: "";
+}
+
 function isRealTurn(e: { type?: string; message?: { role?: string; content?: unknown } }): boolean {
 	if (e.type !== "message") return false;
 	const m = e.message;
 	if (!m || m.role !== "user") return false;
-	const text =
-		typeof m.content === "string"
-			? m.content
-			: Array.isArray(m.content)
-				? (m.content as { type?: string; text?: string }[])
-						.filter((x) => x?.type === "text")
-						.map((x) => x.text ?? "")
-						.join(" ")
-				: "";
+	const text = userMessageText(m.content);
 	return !text.startsWith("qq: ") && !text.startsWith("qqro: ");
 }
 
@@ -894,11 +903,14 @@ export function detectSideThreadRoot(
 	// skips over it (it is not a question marker, not a close marker).
 	const isForkMarker = (e: QqBranchEntry) =>
 		e.type === "custom" && (e.customType === "qq" || e.customType === "qqro") && e.data?.fork === true;
-	const isSideUser = (e: QqBranchEntry) =>
-		e.type === "message" &&
-		e.message?.role === "user" &&
-		typeof e.message.content === "string" &&
-		(e.message.content.startsWith("qq: ") || e.message.content.startsWith("qqro: "));
+	const isSideUser = (e: QqBranchEntry) => {
+		const text = userMessageText(e.message?.content);
+		return (
+			e.type === "message" &&
+			e.message?.role === "user" &&
+			(text.startsWith("qq: ") || text.startsWith("qqro: "))
+		);
+	};
 	const isAnswer = (e: QqBranchEntry) => e.type === "message" && e.message?.role === "assistant";
 
 	let j = branch.length - 1;
