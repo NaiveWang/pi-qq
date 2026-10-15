@@ -1062,7 +1062,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 				getSuggestions: (lines, line, col, opts) =>
 					current.getSuggestions(lines, line, col, opts).then((s) => {
 						if (!s) return s;
-						const hidden = new Set(sideMode ? ["qq", "qqro"] : []);
+						// /nvm is a real command but a mode command — keep it out of
+						// the slash list always; /qq//qqro are hidden while in the
+						// thread (hidden == declined in-mode).
+						const hidden = new Set(sideMode ? ["qq", "qqro", "nvm"] : ["nvm"]);
 						const items = s.items.filter((it) => !hidden.has(it.value));
 						return items.length === 0 ? null : { ...s, items };
 					}),
@@ -1224,15 +1227,67 @@ export default function qqExtension(pi: ExtensionAPI) {
 		"Quick side question (read-only tools only) — f follow-up, m merges, d dismisses",
 	);
 
-	// /ro, /sub, /merge and /nvm are MODE-SCOPED. pi's command registry is
+	// /nvm (drop the whole side session) IS a registered command — unlike
+	// /ro, /sub, /merge, dropping needs ctx.navigateTree, which only a
+	// COMMAND context has (the input-event context does not — the input
+	// handler used to call dropThread and crashed with "navigateTree is
+	// not a function"). So /nvm is registered: inside a side thread (fresh
+	// or resumed) it drops via the command context; outside one it passes
+	// through to the model as a plain message, the same as any unknown
+	// slash text. It is hidden from autocomplete — a mode command you learn
+	// from the mode banner.
+	pi.registerCommand("nvm", {
+		description:
+			"Side thread only: drop the whole side session (never mind). Outside a side thread it is sent to the model as a message.",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const c = ctx;
+			if (sideMode || thread.root) {
+				if (inFlight) {
+					c.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
+					return;
+				}
+				if (!threadAlive(c.sessionManager)) {
+					// A stale root (absorbed out-of-band or orphaned) must
+					// NEVER be rewound — that would drop real conversation.
+					exitMode();
+					clearThread(thread);
+					return;
+				}
+				const sessionId = c.sessionManager.getSessionId();
+				const root = thread.root && thread.sessionId === sessionId ? thread.root : null;
+				exitMode();
+				if (root) {
+					try {
+						await dropThread(c, sessionId, root, dropFlags);
+						clearThread(thread);
+					} catch (err) {
+						c.ui.notify(
+							`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)}`,
+							"error",
+						);
+					}
+				} else {
+					clearThread(thread);
+					c.ui.notify("Back to the main conversation — the side session is dropped.", "info");
+				}
+				return;
+			}
+			// Outside a side thread: pass through to the model as a message.
+			const fullText = args.trim() ? `/nvm ${args.trim()}` : "/nvm";
+			pi.sendUserMessage(fullText);
+		},
+	});
+
+	// /ro, /sub and /merge are MODE-SCOPED. pi's command registry is
 	// static (no unregister), so they are NOT registered commands at all —
 	// this permanent input handler (registered before the mode handler
 	// below) intercepts them instead: inside a side thread (or with a
 	// restored thread) it consumes them; outside, it lets them pass
 	// through, so pi treats them like any unknown slash text — a plain
 	// message. (pi dispatches REGISTERED extension commands before the
-	// input event — agent-session prompt() — so /qq and /qqro cannot be
-	// intercepted here; their in-mode guard lives in the command handler.
+	// input event — agent-session prompt() — so /qq, /qqro and /nvm cannot
+	// be intercepted here: /qq//qqro's in-mode guard lives in the command
+	// handler, and /nvm is itself a command that passes through there.
 	// And pi's BUILT-IN /fork — fork the session — wins the bare /fork
 	// exact match, which is why the sub-thread command is /sub.)
 	pi.on("input", async (event: InputEvent, ctx) => {
@@ -1303,40 +1358,8 @@ export default function qqExtension(pi: ExtensionAPI) {
 			c.ui.notify("Side session merged — everything since the first /qq is now part of the conversation.", "info");
 			return { action: "handled" };
 		}
-		if (text === "/nvm" || text.startsWith("/nvm ")) {
-			if (!sideMode && !thread.root) return { action: "continue" };
-			if (inFlight) {
-				c.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
-				return { action: "handled" };
-			}
-			if (!threadAlive(c.sessionManager)) {
-				// A stale root (absorbed out-of-band, e.g. an rpc turn, or
-				// orphaned) must NEVER be rewound — that would drop real
-				// conversation. Clear the stale state and end the mode.
-				exitMode();
-				clearThread(thread);
-				return { action: "handled" };
-			}
-			const sessionId = c.sessionManager.getSessionId();
-			const root = thread.root && thread.sessionId === sessionId ? thread.root : null;
-			exitMode();
-			if (root) {
-				try {
-					await dropThread(c, sessionId, root, dropFlags);
-					clearThread(thread);
-				} catch (err) {
-					// Keep the thread state so /qq + d can retry the rewind.
-					c.ui.notify(
-						`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)} — press /qq and hit d to retry.`,
-						"error",
-					);
-				}
-			} else {
-				clearThread(thread);
-				c.ui.notify("Back to the main conversation.", "info");
-			}
-			return { action: "handled" };
-		}
+		// /nvm is a registered command (see above) — pi dispatches it before
+		// the input event, so it never reaches this handler.
 		return { action: "continue" };
 	});
 }

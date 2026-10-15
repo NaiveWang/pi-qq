@@ -214,6 +214,24 @@ export async function waitFor(cond: () => boolean, what: string, ms = 3000): Pro
 export const isPending = (env: Env): boolean => env.ctx.terminal.size > 0;
 
 /**
+ * Faithful to pi: the input-event context (createContext) does NOT expose
+ * navigateTree — only command contexts (createCommandContext) do. The mock
+ * otherwise hands the same full MockCtx to both, which is exactly the
+ * divergence that let /nvm "work" in tests while crashing in pi with
+ * "ctx.navigateTree is not a function". So input handlers get a view of the
+ * context with navigateTree removed.
+ */
+export function inputContext(ctx: MockCtx): MockCtx {
+	return new Proxy(ctx, {
+		get(target, prop) {
+			if (prop === "navigateTree") return undefined;
+			const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+			return typeof v === "function" ? v.bind(target) : v;
+		},
+	});
+}
+
+/**
  * Submit text the way pi's editor would (agent-session prompt()):
  *  1. if the text is a registered slash command, dispatch it IMMEDIATELY
  *     (before the input event — extension commands manage their own LLM
@@ -243,7 +261,7 @@ export async function submitInput(
 		}
 	}
 	for (const h of env.pi.listeners.get("input") ?? []) {
-		const r = (await h({ type: "input", text, source }, env.ctx)) as { action?: string } | undefined;
+		const r = (await h({ type: "input", text, source }, inputContext(env.ctx))) as { action?: string } | undefined;
 		if (r?.action === "handled") return "consumed";
 	}
 	env.pi.sentMessages.push(text);

@@ -44,10 +44,10 @@ async function toPending(env: Env, cmd: string, question: string): Promise<void>
 // 1. Command surface
 // ---------------------------------------------------------------------------
 
-test("registers /qq and /qqro; /ro and /nvm are input-level (mode-scoped), not commands", () => {
+test("registers /qq, /qqro and /nvm as commands; /ro, /sub, /merge are input-level (mode-scoped), not commands", () => {
 	const env = makeEnv();
-	for (const name of ["qq", "qqro"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
-	for (const name of ["ro", "nvm"]) assert.ok(!env.pi.commands.has(name), `/${name} NOT a registered command`);
+	for (const name of ["qq", "qqro", "nvm"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
+	for (const name of ["ro", "sub", "merge"]) assert.ok(!env.pi.commands.has(name), `/${name} NOT a registered command`);
 	assert.match(env.pi.commands.get("qq")!.description, /f follow-up/);
 	assert.match(env.pi.commands.get("qqro")!.description, /read-only/);
 });
@@ -374,10 +374,33 @@ test("/nvm drops the whole thread and returns to the main conversation", async (
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
 });
 
-test("/nvm with no thread is NOT a command (passes through as a message)", async () => {
+test("/nvm with no thread is a command that passes through as a message", async () => {
 	const env = makeEnv();
-	assert.equal(await submitInput(env, "/nvm"), "message", "not consumed, not a registered command");
-	assert.equal(env.ctx.notifs.length, 0, "no warning — it just goes to the model");
+	assert.equal(await submitInput(env, "/nvm"), "command", "a registered command");
+	assert.ok(
+		env.pi.sentMessages.includes("/nvm"),
+		"outside a side thread it is re-sent to the model as a plain message",
+	);
+});
+
+test("REGRESSION: input-event ctx has NO navigateTree (command ctx does) — why /nvm must be a command", async () => {
+	const env = makeEnv();
+	// Capture the context an ACTUAL input handler receives via the dispatch.
+	// Faithful to pi: the input-event context (createContext) lacks
+	// navigateTree; only the command context (createCommandContext) has it.
+	// The mock enforces this so /nvm (a command) can never regress into an
+	// input handler that crashes with "ctx.navigateTree is not a function".
+	const captured: { ctx?: { navigateTree?: unknown } } = {};
+	env.pi.on(
+		"input",
+		((_e: unknown, ctx: unknown) => {
+			captured.ctx = ctx as { navigateTree?: unknown };
+			return { action: "continue" };
+		}) as unknown as (event: unknown) => unknown,
+	);
+	await submitInput(env, "probe");
+	assert.equal(captured.ctx?.navigateTree, undefined, "the dispatched input ctx has NO navigateTree");
+	assert.equal(typeof env.ctx.navigateTree, "function", "the command ctx HAS navigateTree");
 });
 
 test("/nvm while a side question is in flight warns and does not rewind", async () => {
@@ -1375,7 +1398,7 @@ test("/nvm after out-of-band absorption does NOT rewind the real turn (stale sta
 	assert.equal(env.ctx.editorComponents.at(-1) !== undefined, true, "stale mode still on");
 
 	const res = await submitInput(env, "/nvm");
-	assert.equal(res, "consumed", "stale /nvm is consumed, not passed through");
+	assert.equal(res, "command", "stale /nvm is a no-op command (not passed through, nothing rewound)");
 	assert.ok(env.session.findUserEntry("qq: q1"), "absorbed side Q&A kept");
 	assert.ok(env.session.findUserEntry("real turn"), "real turn kept — NOTHING rewound");
 	assert.equal(env.ctx.editorComponents.at(-1), undefined, "stale mode ended");
