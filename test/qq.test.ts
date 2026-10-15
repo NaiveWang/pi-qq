@@ -84,7 +84,7 @@ test("happy path: marker + labeled message, PENDING, dismiss rewinds to homeLeaf
 	assert.match(sent, /Do not use any tools/);
 
 	// Dismiss → rewind to homeLeaf.
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed")));
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
@@ -105,7 +105,7 @@ test("merge (m): no rewind, close marker at the leaf, thread ends", async () => 
 	// Thread ended: a NEW side question starts a fresh thread — dismissing it
 	// must NOT rewind past the merged Q&A.
 	const p2 = await toPending(env, "qq", "q2");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => !!env.session.findUserEntry("qq: q1"), "merged Q&A survives a later dismiss");
 	assert.ok(!env.session.findUserEntry("qq: q2"), "only the new question was removed");
@@ -126,27 +126,47 @@ test("M and F are case-insensitive", async () => {
 	assert.ok(env.ctx.notifyOf((m) => m.includes("follow-up")));
 });
 
-test("dismiss: printable key passes through, control key is consumed", async () => {
+test("other keys are swallowed and the gate STAYS armed (no accidental dismiss)", async () => {
 	const env = makeEnv({ answer: "a" });
+	const homeLeaf = env.session.leafId!;
 	const p = await toPending(env, "qq", "q");
-	const resPrintable = env.ctx.press("h");
-	assert.equal(resPrintable[0], undefined, "printable key passes through to the editor");
-	await p;
+	const answerLeaf = env.session.leafId!;
+	assert.notEqual(answerLeaf, homeLeaf, "the side answer advanced the leaf");
 
-	const p2 = await toPending(env, "qq", "q2");
-	const resCtrl = env.ctx.press("\u0003");
-	assert.deepEqual(resCtrl[0], { consume: true }, "control key is consumed");
-	await p2;
+	// A stray printable key: consumed, thread NOT dismissed, gate still armed.
+	const res1 = env.ctx.press("h");
+	assert.deepEqual(res1[0], { consume: true }, "stray printable key is consumed");
+	assert.equal(env.session.leafId, answerLeaf, "stray key did NOT dismiss the thread");
+	assert.ok(isPending(env), "gate still armed after a stray key");
+
+	// A stray control key: also consumed, still armed.
+	const res2 = env.ctx.press("\u0003");
+	assert.deepEqual(res2[0], { consume: true }, "stray control key is consumed");
+	assert.equal(env.session.leafId, answerLeaf, "still not dismissed");
+	assert.ok(isPending(env), "gate still armed");
+
+	// The gate is still armed: an explicit d now dismisses. Wait for the
+	// success notice (emitted AFTER the rewind completes) so both the leaf
+	// update and the notification are done — waiting on the leaf alone races
+	// with the fire-and-forget drop.
+	env.ctx.press("d");
+	await p;
+	await waitFor(
+		() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed")),
+		"dismiss success notice",
+	);
+	assert.equal(env.session.leafId, homeLeaf, "d rewound to homeLeaf");
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
 });
 
 test("status set during PENDING and cleared after the keypress", async () => {
 	const env = makeEnv({ answer: "a" });
 	const p = await toPending(env, "qq", "q");
 	assert.ok(
-		env.ctx.statuses.some((s) => s.key === "qq" && s.status === "side answer · f follow-up · m merges · any other key dismisses the thread"),
+		env.ctx.statuses.some((s) => s.key === "qq" && s.status === "side answer · f follow-up · m merges · d dismisses (other keys ignored)"),
 		"status shown while pending",
 	);
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p;
 	const last = [...env.ctx.statuses].reverse().find((s) => s.key === "qq");
 	assert.equal(last?.status, undefined, "status cleared after keypress");
@@ -157,7 +177,7 @@ test("prompt note: /qq has no tools, /qqro is read-only", async () => {
 	await toPending(env, "qqro", "q");
 	const sent = env.pi.sentMessages[0];
 	assert.match(sent, /read-only tools \(read, grep, find, ls\)/);
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => !isPending(env), "settled");
 });
 
@@ -265,7 +285,7 @@ test("real turn outside the mode absorbs the thread; next /qq starts fresh", asy
 
 	// The next /qq detects the absorption: FRESH thread, and the mode ends.
 	const p2 = await toPending(env, "qq", "q3");
-	env.ctx.press("x"); // dismiss the q3 probe
+	env.ctx.press("d"); // dismiss the q3 probe
 	await p2;
 	await waitFor(() => env.session.leafId === realAnswer.id, "rewound only the new question");
 	assert.ok(env.session.findUserEntry("qq: q1"), "absorbed Q&A stays");
@@ -586,7 +606,7 @@ test("/tree away after f orphans the thread", async () => {
 	const other = env.session.add("message", { role: "user", content: "other branch" }, threadRoot);
 
 	const p2 = await toPending(env, "qq", "q3");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => env.session.leafId === other.id, "only the new question removed");
 	assert.ok(!env.session.branch(other.id).some((e) => e.message?.content?.toString().startsWith("qq: ")), "no side Q&A on this path");
@@ -724,7 +744,7 @@ test("no leaked subscriptions: merge, dismiss, no-answer, and mode exit", async 
 	// dismiss
 	env = makeEnv({ answer: "a" });
 	p = await toPending(env, "qq", "q");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p;
 	await waitFor(() => env.pi.activeCount() === env.pi.baselineActive, "no leaks after dismiss");
 
@@ -815,7 +835,7 @@ test("rewind waits for idle; stuck-busy fails loud without crashing", async () =
 	const homeLeaf = env.session.leafId!;
 	const p = await toPending(env, "qq", "q");
 	env.ctx.idle = false;
-	env.ctx.press("x");
+	env.ctx.press("d");
 	setTimeout(() => {
 		env.ctx.idle = true;
 	}, 50);
@@ -829,7 +849,7 @@ test("rewind waits for idle; stuck-busy fails loud without crashing", async () =
 	const homeLeafB = env.session.leafId!;
 	const p2 = await toPending(env, "qq", "q");
 	env.ctx.idle = false; // stuck
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("dismiss failed")), "fail-loud notification");
 	assert.notEqual(env.session.leafId, homeLeafB, "nothing was rewound");
@@ -1008,7 +1028,7 @@ test("dismiss PRUNES the thread when the patch is available (no fork, no rewind)
 	const homeLeaf = env.session.leafId!;
 	env.session.pruneBranches = (id) => env.session.pruneSim(id); // simulate patched pi
 	await toPending(env, "qq", "q?");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
 	assert.deepEqual(env.session.pruneCalls, [homeLeaf], "pruned to the thread root");
 	assert.equal(env.session.leafId, homeLeaf);
@@ -1023,7 +1043,7 @@ test("dismiss REWINDS in place when the patch is absent — even if ctx.fork exi
 	env.ctx.installForkSim(); // ctx.fork EXISTS but must not be used —
 	// a fork would create a duplicate session file in /resume per dismiss.
 	await toPending(env, "qq", "q?");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewound to homeLeaf");
 	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf], "plain in-place rewind");
 	assert.equal(env.ctx.forkCalls.length, 0, "NEVER forks");
@@ -1037,7 +1057,7 @@ test("dismiss REWINDS when neither patch nor fork is available (baseline)", asyn
 	const env = makeEnv({ answer: "42" });
 	const homeLeaf = env.session.leafId!;
 	await toPending(env, "qq", "q?"); // unpatched pi: no prune on the mock
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
 	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf]);
 	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed from the conversation")));

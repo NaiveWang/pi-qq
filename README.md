@@ -104,10 +104,11 @@ choice:
   conversation and the next message continues right after the answer. (In
   the thread, `/merge` is the command-level equivalent — same effect, any
   time.)
-- **any other key** → **dismiss** (first answer only): the whole side thread
-  (every question and answer in it) is rewound away and the conversation
-  continues as if it never happened. Printable keys pass through, so you can
-  start typing your next prompt immediately.
+- **d** → **dismiss** (first answer only): the whole side thread (every
+  question and answer in it) is rewound away and the conversation continues
+  as if it never happened. **Any other key is ignored** — the gate stays
+  armed, so a stray keypress can no longer dismiss the thread by accident.
+  Only an explicit f / m / d leaves the pending state.
 
 Mechanically, a pi session is an append-only **tree** of entries and the model
 context is always built from the root→leaf path. `/qq` exploits that:
@@ -116,10 +117,11 @@ context is always built from the root→leaf path. `/qq` exploits that:
    the question (with its tool-policy note) — the Q&A lands on a
    **temporary side branch**.
 2. Waits for the run to fully settle (`agent_settled`).
-3. First answer: puts up "f follow-up · m merges · any other key
-   dismisses" (footer status + notification) and waits for **your**
-   keypress. Follow-up answer (side thread open): no keypress at all — the
-   answer stays and the input box is already yours.
+3. First answer: puts up "f follow-up · m merges · d dismisses (other keys
+   ignored)" (footer status + notification) and waits for **your** keypress.
+   Only f / m / d act; everything else is swallowed and the gate stays armed.
+   Follow-up answer (side thread open): no keypress at all — the answer stays
+   and the input box is already yours.
 4. On dismiss/`/nvm`, **drops the thread at its root** — the leaf before the
    thread's first question, so a whole follow-up thread vanishes at once —
    via the first available tier: prune (exact pi match) → leaf rewind (any
@@ -195,7 +197,8 @@ plus an in-memory session tree exercise the real logic, no pi process
 needed). The scenario matrix covers:
 
 - **lifecycle** — send → settle → PENDING → dismiss/merge, key semantics
-  (case, pass-through vs consume), status line, prompt notes
+  (case, d dismisses vs other keys ignored and the gate stays armed), status
+  line, prompt notes
 - **threads** — follow-up chains, context inheritance, thread absorption by
   a normal message, orphaning via `/tree`
 - **side-thread mode** — plain-text follow-ups, **no keypress gate after a

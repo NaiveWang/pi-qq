@@ -85,11 +85,11 @@
  *      queued continuations are all done).
  *   3. On settled, if an assistant reply exists: enter PENDING state.
  *      - First answer (no mode yet): footer status + notification tell you
- *        the choices. The first terminal keypress decides: m merges (no
- *        rewind), f opens the side thread, any other key dismisses (rewinds
- *        the whole thread to its root). Dismissal consumes control keys and
- *        passes printable characters through, so you can start typing your
- *        next prompt immediately.
+ *        the choices. A persistent keypress gate waits: m merges (no
+ *        rewind), f opens the side thread, d dismisses (rewinds the whole
+ *        thread to its root). Any other key is swallowed and the gate stays
+ *        armed — a stray keypress can no longer dismiss the thread by
+ *        accident. Only an explicit f / m / d leaves the pending state.
  *      - Follow-up answer (mode active): NO keypress — the answer stays on
  *        the branch, a status + notification point at the input box, and
  *        the next plain text is simply the next follow-up. (A single-key
@@ -625,17 +625,20 @@ async function runInline(
 
 	const leaf = sm.getLeafId() as string;
 
-	ctx.ui.setStatus(label, "side answer · f follow-up · m merges · any other key dismisses the thread");
-	ctx.ui.notify(`${label} side answer ready — f follow-up, m merges, any other key dismisses the side thread.`, "info");
+	ctx.ui.setStatus(label, "side answer · f follow-up · m merges · d dismisses (other keys ignored)");
+	ctx.ui.notify(`${label} side answer ready — f follow-up, m merges, d dismisses the side thread (other keys are ignored).`, "info");
 
+	// The gate is PERSISTENT: the handler stays subscribed for every keypress
+	// until one of the three explicit choices (f / m / d) calls offInput().
+	// Any other key is swallowed and the gate re-checks the next key — so a
+	// stray keypress can no longer dismiss the thread by accident.
 	const offInput = ctx.ui.onTerminalInput((data: string) => {
-		offInput();
-		ctx.ui.setStatus(label, undefined);
-
 		// m / M: MERGE — the leaf is already at the side answer, so keeping it
 		// means simply NOT rewinding: the next message continues right after
 		// the Q&A and it becomes part of the live context. Thread ends.
 		if (data === "m" || data === "M") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
 			mode.exit();
 			// Close marker: without it a resumed session cannot tell a MERGED
 			// thread from an OPEN one (identical branch shape). Custom
@@ -651,6 +654,8 @@ async function runInline(
 		// runs as the next side question; /ro toggles the tool policy; /nvm
 		// drops the whole thread.
 		if (data === "f" || data === "F") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
 			mode.enter(ctx);
 			ctx.ui.notify(
 				`${label} side thread open — just type a follow-up (it runs as a side question) · /ro read-only · /sub sub-thread · /merge to main · /nvm back.`,
@@ -659,27 +664,32 @@ async function runInline(
 			return { consume: true };
 		}
 
-		// anything else: DISMISS — drop the WHOLE side thread via the ladder
+		// d / D: DISMISS — drop the WHOLE side thread via the ladder
 		// (prune → rewind; see dropThread, which emits the success
 		// notice itself). The thread state is cleared only AFTER a
 		// successful drop so a failed one can be retried with another /qq.
-		mode.exit();
-		void (async () => {
-			try {
-				if (sm.getLeafId() === leaf) {
-					const target = thread.root ?? homeLeaf;
-					await dropThread(ctx, sessionId, target, dropFlags);
+		if (data === "d" || data === "D") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
+			mode.exit();
+			void (async () => {
+				try {
+					if (sm.getLeafId() === leaf) {
+						const target = thread.root ?? homeLeaf;
+						await dropThread(ctx, sessionId, target, dropFlags);
+					}
+					clearThread(thread);
+				} catch (e) {
+					ctx.ui.notify(`/${label} dismiss failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
 				}
-				clearThread(thread);
-			} catch (e) {
-				ctx.ui.notify(`/${label} dismiss failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
-			}
-		})();
-		// Swallow control/escape keys (so they don't trigger editor actions);
-		// pass printable characters through so you can start typing the next
-		// prompt immediately.
-		const printable = /\p{L}|\p{N}|\p{P}|\p{S}|\p{Z}/u.test(data);
-		return printable ? undefined : { consume: true };
+			})();
+			return { consume: true };
+		}
+
+		// anything else: NO ACTION — swallow the key and stay in PENDING. The
+		// handler is NOT unsubscribed, so the next keypress is checked again.
+		// Only an explicit f / m / d leaves the pending state.
+		return { consume: true };
 	});
 }
 
@@ -1035,10 +1045,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 			},
 		});
 
-	register("qq", "Quick side question (no tools) — f follow-up, m merges, any other key dismisses the thread");
+	register("qq", "Quick side question (no tools) — f follow-up, m merges, d dismisses the thread");
 	register(
 		"qqro",
-		"Quick side question (read-only tools only) — f follow-up, m merges, any other key dismisses",
+		"Quick side question (read-only tools only) — f follow-up, m merges, d dismisses",
 	);
 
 	// /ro, /sub, /merge and /nvm are MODE-SCOPED. pi's command registry is
@@ -1142,9 +1152,9 @@ export default function qqExtension(pi: ExtensionAPI) {
 					await dropThread(c, sessionId, root, dropFlags);
 					clearThread(thread);
 				} catch (err) {
-					// Keep the thread state so /qq + any key can retry the rewind.
+					// Keep the thread state so /qq + d can retry the rewind.
 					c.ui.notify(
-						`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)} — press /qq and hit any key to retry.`,
+						`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)} — press /qq and hit d to retry.`,
 						"error",
 					);
 				}
