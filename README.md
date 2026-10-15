@@ -11,9 +11,10 @@ in `/tree`). This extension closes that gap. At load time it **additively
 installs** `pruneBranches(keepLeafId?)` on `SessionManager.prototype` —
 keeping only the root→leaf path, rebuilding pi's own index, and rewriting the
 session file. Never overriding an existing method, and only when the running
-pi version **exactly** matches the pin (`config.patchTargetPiVersion`,
-currently **1.1.0** — the patch touches private-by-convention internals that
-may drift on any release).
+pi version is in the verified allowlist (`config.patchTargetPiVersions`,
+currently **1.1.0 and 1.2.0** — the patch touches private-by-convention
+internals, so a version is added only after confirming `SessionManager` is
+byte-identical).
 
 Dismiss and `/nvm` then drop the thread through a ladder — the first tier
 that works wins:
@@ -155,7 +156,7 @@ the recurring cost — the exchange never rides along in every subsequent turn.
 pi install npm:@elvinw/pi-qq
 ```
 
-Works on any pi: on pi **1.1.0** exactly, dismissed threads are physically
+Works on any pi: on pi **1.1.0 or 1.2.0**, dismissed threads are physically
 pruned from the session file (see above); on other pi versions the extension
 automatically degrades to the plain dead-branch behavior.
 
@@ -175,14 +176,15 @@ when it loads the extension.
 ## Development
 
 ```bash
-npm install        # pulls the published pi-coding-agent 1.1.0 types + tsc
+npm install        # pulls the published pi-coding-agent 1.2.0 types + tsc
 npm run typecheck
 npm test           # 57 scenario tests (node:test, no extra deps)
 ```
 
 The `pi-coding-agent` dev-dependency is **exactly pinned** (no `^`) because
-the self-patch — and the tests around it — target one specific pi version;
-it also exists for local typechecking against the published API.
+the self-patch — and the tests around it — target a verified pi version
+(1.2.0, the newest in the allowlist); it also exists for local typechecking
+against the published API.
 `node_modules/` is git-ignored.
 
 ### Tests
