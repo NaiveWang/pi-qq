@@ -99,7 +99,7 @@
  *
  * After a dismiss, the thread is dropped by the first tier that works
  * (see dropThread): when the SessionManager self-patch is active (running pi
- * exactly matches config.patchTargetPiVersion) the thread is PRUNED from the
+ * is one of config.patchTargetPiVersions) the thread is PRUNED from the
  * session file — physically gone; on any other pi it is rewound in place
  * (dead branch left in /tree). It is NEVER forked away: a fork would
  * duplicate the whole history in /resume once per dismiss.
@@ -134,12 +134,13 @@ export const config = {
 	/** How long a queued question may wait for the agent to settle. */
 	queueTimeoutMs: 2 * 60 * 60 * 1000,
 	/**
-	 * The EXACT pi version the pruneBranches self-patch targets. No ranges —
-	 * the patch touches private-by-convention internals that may drift on any
-	 * release. On any other pi the patch does not install and drops degrade
-	 * to an in-place rewind.
+	 * The pi versions the pruneBranches self-patch may install on. An explicit
+	 * allowlist, NOT a semver range: the patch touches private-by-convention
+	 * internals, so a version is added only after verifying SessionManager is
+	 * byte-identical (1.1.0 and 1.2.0 are). On any other pi the patch does
+	 * not install and drops degrade to an in-place rewind.
 	 */
-	patchTargetPiVersion: "1.1.0",
+	patchTargetPiVersions: ["1.1.0", "1.2.0"],
 };
 
 // ── True deletion of dismissed threads: additive SessionManager self-patch ──
@@ -147,8 +148,8 @@ export const config = {
 // Mainline pi is append-only: a dismissed thread can at best be ORPHANED
 // (leaf moved back; the entries stay in the file/tree). This extension
 // closes that gap by ADDITIVELY installing `pruneBranches(keepLeafId?)` on
-// SessionManager.prototype at load time — and ONLY when the running pi
-// version EXACTLY matches config.patchTargetPiVersion. Additive by design:
+// SessionManager.prototype at load time — and ONLY when the running pi is
+// one of config.patchTargetPiVersions (a verified allowlist). Additive by design:
 // an existing (native) pruneBranches is never overridden, and a version
 // mismatch leaves the class untouched (the drop ladder degrades to an
 // in-place rewind instead of risking a bad rewrite). In-memory only —
@@ -208,8 +209,8 @@ function readPiVersion(): string | undefined {
 
 /**
  * Install `pruneBranches(keepLeafId?)` on SessionManager.prototype when
- * (and only when) the running pi exactly matches config.patchTargetPiVersion
- * and the required internals are present. Idempotent.
+ * (and only when) the running pi is one of config.patchTargetPiVersions and
+ * the required internals are present. Idempotent.
  *
  * The installed method keeps only the root→keepLeafId path, drops every
  * other branch, rebuilds pi's own in-memory index (_buildIndex), re-pins
@@ -218,8 +219,8 @@ function readPiVersion(): string | undefined {
  */
 export function installSessionPrune(): PruneInstallStatus {
 	const version = readPiVersion();
-	if (version !== config.patchTargetPiVersion) {
-		return { installed: false, reason: `pi ${version ?? "unknown"} ≠ required ${config.patchTargetPiVersion}` };
+	if (!version || !config.patchTargetPiVersions.includes(version)) {
+		return { installed: false, reason: `pi ${version ?? "unknown"} not in supported [${config.patchTargetPiVersions.join(", ")}]` };
 	}
 	const proto = SessionManager.prototype as unknown as Record<string, unknown>;
 	if (typeof proto.pruneBranches === "function") return { installed: true, native: true };
@@ -431,7 +432,7 @@ async function dropThread(
 	if (!flags.pruneFallbackNotified) {
 		flags.pruneFallbackNotified = true;
 		ctx.ui.notify(
-			`qq: true deletion is unavailable (${pruneStatus.reason ?? "the session changed while waiting"}) — rewinding in place instead. The side thread's entries stay in the file (visible in /tree); true deletion targets pi ${config.patchTargetPiVersion}.`,
+			`qq: true deletion is unavailable (${pruneStatus.reason ?? "the session changed while waiting"}) — rewinding in place instead. The side thread's entries stay in the file (visible in /tree); true deletion targets pi ${config.patchTargetPiVersions.join(" or ")}.`,
 			"warning",
 		);
 	}
@@ -771,7 +772,7 @@ function preflightUsage(ctx: ExtensionCommandContext, label: string): void {
 
 export default function qqExtension(pi: ExtensionAPI) {
 	// True deletion: install SessionManager.pruneBranches when the running
-	// pi exactly matches config.patchTargetPiVersion. On any mismatch this
+	// pi is one of config.patchTargetPiVersions. On any mismatch this
 	// is a no-op and drops degrade to an in-place rewind.
 	pruneStatus = installSessionPrune();
 

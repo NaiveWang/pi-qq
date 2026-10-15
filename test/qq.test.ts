@@ -953,14 +953,23 @@ test("installSessionPrune is idempotent (an existing method is never overridden)
 });
 
 test("installSessionPrune refuses a version mismatch", () => {
-	const prev = config.patchTargetPiVersion;
-	config.patchTargetPiVersion = "9.9.9";
+	const prev = config.patchTargetPiVersions;
+	config.patchTargetPiVersions = ["9.9.9"];
 	try {
 		const status = installSessionPrune();
 		assert.equal(status.installed, false);
 		assert.match(status.reason ?? "", /9\.9\.9/);
 	} finally {
-		config.patchTargetPiVersion = prev;
+		config.patchTargetPiVersions = prev;
+	}
+});
+
+test("installSessionPrune allowlist covers both verified pi versions", () => {
+	// 1.1.0 and 1.2.0 have byte-identical SessionManager, so both are safe
+	// patch targets. Guard the allowlist so a future edit doesn't silently
+	// drop one of them.
+	for (const v of ["1.1.0", "1.2.0"]) {
+		assert.ok(config.patchTargetPiVersions.includes(v), `allowlist missing ${v}`);
 	}
 });
 
