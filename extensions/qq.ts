@@ -127,7 +127,12 @@ type QqEditorArgs = QqEditorFactory extends (...args: infer A) => unknown ? A : 
  * can tune them) without touching the logic.
  */
 export const config = {
-	/** How long to wait for the side turn to settle before giving up. */
+	/**
+	 * How long the side turn may go SILENT (no streaming output, no tool
+	 * activity) before it is declared hung. The clock re-arms on every sign of
+	 * life, so a long-but-active answer (e.g. a long reasoning stream) never
+	 * times out — only a run that produces nothing for this long does.
+	 */
 	settleTimeoutMs: 5 * 60 * 1000,
 	/** How long to wait for true idle before declaring a rewind failed. */
 	idleTimeoutMs: 60 * 1000,
@@ -491,11 +496,35 @@ async function runInline(
 	// requested in the prompt note AND enforced by the guardrail below.
 	pi.appendEntry(label, { question });
 
+	// Activity-aware settle timeout. A fixed deadline from send would kill a
+	// long-but-active answer (e.g. a /qqro answer with a long reasoning stream
+	// still producing output well past 5 minutes). Instead the timer re-arms
+	// on every sign of life — a streaming chunk (message_update) or a tool
+	// call — so the deadline is "settleTimeoutMs of SILENCE", not
+	// "settleTimeoutMs in total". A genuinely hung run (no output for 5
+	// minutes) still times out; an active one never does.
+	let resolveTimeout: (r: "timeout") => void;
+	let settleTimer: ReturnType<typeof setTimeout> | undefined;
+	let settleTimerFired = false;
+	const armSettleTimer = () => {
+		if (settleTimerFired) return;
+		if (settleTimer !== undefined) clearTimeout(settleTimer);
+		settleTimer = setTimeout(() => {
+			settleTimerFired = true;
+			resolveTimeout("timeout");
+		}, config.settleTimeoutMs);
+	};
+	const settleTimeout = new Promise<"timeout">((r) => (resolveTimeout = r));
+	const offActivity = pi.on("message_update", () => armSettleTimer());
+
 	// Guardrail: block any tool call outside this command's allow-list for
 	// the duration of the side turn. The blocked call becomes an error result
-	// the model sees, so it falls back to a text answer.
+	// the model sees, so it falls back to a text answer. A tool call is also a
+	// sign of life, so it re-arms the settle timer (covers the gap while a
+	// read-only tool runs, when no message_update fires).
 	const allow = policy === "ro" ? new Set(["read", "grep", "find", "ls"]) : new Set<string>();
 	const offToolCall = pi.on("tool_call", (event) => {
+		armSettleTimer();
 		if (allow.has(event.toolName)) return;
 		return {
 			block: true,
@@ -530,21 +559,19 @@ async function runInline(
 	// a leaked session_before_compact handler would silently cancel every
 	// future compaction, and a leaked guardrail would block tools forever.
 	let result: "settled" | "timeout";
-	let settleTimer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		pi.sendUserMessage(
 			images && images.length > 0
 				? [{ type: "text", text: `${label}: ${question}\n\n(${note})` }, ...images]
 				: `${label}: ${question}\n\n(${note})`,
 		);
-		const timeout = new Promise<"timeout">((r) => {
-			settleTimer = setTimeout(() => r("timeout"), config.settleTimeoutMs);
-		});
-		result = await Promise.race([settled.then(() => "settled" as const), timeout]);
+		armSettleTimer(); // start the silence clock
+		result = await Promise.race([settled.then(() => "settled" as const), settleTimeout]);
 	} finally {
 		if (settleTimer !== undefined) clearTimeout(settleTimer);
 		offSettled();
 		offBeforeCompact();
+		offActivity();
 		offToolCall();
 	}
 

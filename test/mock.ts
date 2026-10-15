@@ -24,6 +24,12 @@ export interface AgentBehavior {
 	delayMs?: number;
 	/** false = the run never settles (timeout tests). */
 	settles?: boolean;
+	/**
+	 * Stream `message_update` events every `everyMs` for `totalMs` before
+	 * settling — simulates a long, actively-streaming answer (e.g. a long
+	 * reasoning chain). Exercises the activity-aware settle timeout.
+	 */
+	stream?: { everyMs: number; totalMs: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +110,22 @@ export class MockPi {
 			// The run never emits agent_settled (broken/lost settle event), but
 			// the session itself goes idle — the realistic failure mode.
 			this.ctx.idle = true;
+			return;
+		}
+		if (this.behavior.stream) {
+			// Actively-streaming run: emit message_update on an interval for the
+			// whole duration, then finish. The updates keep re-arming the
+			// activity-aware settle timer, so the run settles even if totalMs is
+			// far longer than settleTimeoutMs.
+			const { everyMs, totalMs } = this.behavior.stream;
+			let elapsed = 0;
+			const tick = () => {
+				this.emit("message_update", {});
+				elapsed += everyMs;
+				if (elapsed >= totalMs) this.finishRun();
+				else setTimeout(tick, everyMs);
+			};
+			setTimeout(tick, everyMs);
 			return;
 		}
 		setTimeout(() => this.finishRun(), this.behavior.delayMs ?? 20);

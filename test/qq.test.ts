@@ -642,6 +642,26 @@ test("settle timeout → error, rewind, in-flight released", async () => {
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive);
 });
 
+test("activity-aware settle timeout: a long streaming answer survives past the fixed deadline", async () => {
+	// The run streams for 450ms (3x the 150ms deadline) but emits a
+	// message_update every 30ms. The activity-aware timer re-arms on each
+	// update, so it settles cleanly instead of timing out at 150ms.
+	config.settleTimeoutMs = 150;
+	const env = makeEnv({ answer: "long answer", stream: { everyMs: 30, totalMs: 450 } });
+	const homeLeaf = env.session.leafId!;
+	await toPending(env, "qq", "q");
+	assert.ok(!env.ctx.notifyOf((m) => m.includes("timed out")), "no timeout despite total > deadline");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("side answer ready")), "reached PENDING (answer delivered)");
+
+	// Clean up: dismiss (rewinds to homeLeaf), confirm no leaked subscriptions.
+	env.ctx.press("d");
+	await waitFor(
+		() => env.session.leafId === homeLeaf && !!env.ctx.notifyOf((m) => m.includes("Side thread removed")),
+		"dismissed",
+	);
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
+});
+
 test("failed question mid-thread keeps the thread alive", async () => {
 	const env = makeEnv({ answer: "a1" });
 	const root = env.session.leafId!;
