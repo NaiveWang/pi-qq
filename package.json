@@ -1,6 +1,6 @@
 {
 	"name": "@elvinw/pi-qq",
-	"version": "0.5.5",
+	"version": "0.5.6",
 	"description": "/qq — quick side questions for pi that don't enter the conversation context (Claude Code's /btw, for pi)",
 	"keywords": [
 		"pi-package",
