@@ -114,6 +114,7 @@ import type {
 	ExtensionCommandContext,
 	InputEvent,
 	InputEventResult,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 // pi's EditorFactory (ui.setEditorComponent's factory) is not re-exported
@@ -400,14 +401,127 @@ function isRealTurn(e: { type?: string; message?: { role?: string; content?: unk
 }
 
 /**
+ * A structural copy of pi's Usage (pi-coding-agent does not re-export the
+ * type). Only the fields pi's session stats read are needed; the optional
+ * splits (cacheWrite1h, reasoning) are preserved when present.
+ */
+interface QqUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number;
+	reasoning?: number;
+	totalTokens: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+function addQqUsage(a: QqUsage, b: QqUsage): QqUsage {
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		...(a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined
+			? { cacheWrite1h: (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0) }
+			: {}),
+		...(a.reasoning !== undefined || b.reasoning !== undefined
+			? { reasoning: (a.reasoning ?? 0) + (b.reasoning ?? 0) }
+			: {}),
+		totalTokens: a.totalTokens + b.totalTokens,
+		cost: {
+			input: a.cost.input + b.cost.input,
+			output: a.cost.output + b.cost.output,
+			cacheRead: a.cost.cacheRead + b.cost.cacheRead,
+			cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
+			total: a.cost.total + b.cost.total,
+		},
+	};
+}
+
+/**
+ * The session-manager surface dropThread needs beyond the readonly pick
+ * (appendUsage is a mutating method, so it is not on ReadonlySessionManager).
+ */
+interface QqSessionManager {
+	pruneBranches?: (keepLeafId?: string) => number;
+	getBranch(leafId?: string): SessionEntry[];
+	appendUsage(
+		kind: string,
+		provider: string,
+		model: string,
+		usage: QqUsage,
+		note?: string,
+	): { id: string };
+}
+
+/**
+ * Sum the billed usage of the side branch — everything on the current
+ * root→leaf path after the branch point `targetId`. Mirrors the entry types
+ * pi's own session stats read (assistant + toolResult messages, usage
+ * entries, compaction/branch summaries) so nothing the stats would have
+ * counted is lost when the branch is pruned. Returns null when there is no
+ * usage to preserve. The provider/model come from the last usage-bearing
+ * entry so /cost groups the preserved total under the model that actually
+ * ran the side thread.
+ */
+function sumSideBranchUsage(
+	sm: { getBranch(): SessionEntry[] },
+	targetId: string,
+): { provider: string; model: string; usage: QqUsage } | null {
+	const branch = sm.getBranch();
+	const targetIdx = branch.findIndex((e) => e.id === targetId);
+	if (targetIdx < 0) return null;
+	let total: QqUsage | null = null;
+	let provider = "";
+	let model = "";
+	for (let i = targetIdx + 1; i < branch.length; i++) {
+		const e = branch[i];
+		let u: QqUsage | undefined;
+		let p = "";
+		let m = "";
+		if (e.type === "message") {
+			const msg = e.message as {
+				role: string;
+				usage?: QqUsage;
+				provider?: string;
+				model?: string;
+				responseModel?: string;
+			};
+			if (msg.role === "assistant" && msg.usage) {
+				u = msg.usage;
+				p = msg.provider ?? "";
+				m = msg.responseModel ?? msg.model ?? "";
+			} else if (msg.role === "toolResult" && msg.usage) {
+				u = msg.usage;
+			}
+		} else if (e.type === "usage") {
+			u = e.usage as QqUsage;
+			p = e.provider;
+			m = e.model;
+		} else if ((e.type === "branch_summary" || e.type === "compaction") && (e as { usage?: QqUsage }).usage) {
+			u = (e as { usage?: QqUsage }).usage;
+		}
+		if (!u) continue;
+		total = total ? addQqUsage(total, u) : { ...u };
+		if (p) provider = p;
+		if (m) model = m;
+	}
+	return total ? { provider, model, usage: total } : null;
+}
+
+/**
  * Drop a side thread anchored at `target` (the leaf before its first
  * question). Ladder — the first tier that succeeds wins:
  *
  *  1. PRUNE  (self-patch active — the running pi exactly matches the pin):
  *     the thread is physically removed from the session file: no dead
  *     branch in /tree, same session id. (Also tidies any other orphans.)
+ *     The branch's billed usage is preserved first — a `usage` entry is
+ *     appended at the branch point and the prune keeps it — so the tokens
+ *     keep counting in the session stats even though the entries are gone.
  *  2. REWIND (any other pi): orphan the thread — it leaves the context,
- *     the entries remain in the tree.
+ *     the entries remain in the tree (and so their usage keeps counting).
  *
  * There is deliberately NO fork tier: `ctx.fork()` "removes" the thread
  * by creating a NEW session file holding the entire history, so every
@@ -423,14 +537,34 @@ async function dropThread(
 	target: string,
 	flags: { pruneFallbackNotified: boolean },
 ): Promise<"pruned" | "rewound"> {
-	const sm = ctx.sessionManager as unknown as { pruneBranches?: (keepLeafId?: string) => number };
+	const sm = ctx.sessionManager as unknown as QqSessionManager;
 	if (
 		pruneStatus.installed &&
 		typeof sm.pruneBranches === "function" &&
 		ctx.sessionManager.getSessionId() === sessionId &&
 		(await waitUntilIdle(ctx, config.idleTimeoutMs))
 	) {
-		sm.pruneBranches(target);
+		// Preserve the side branch's billed usage before it is pruned away. The
+		// tokens were really spent, so they must keep counting in the session
+		// stats even though the entries are physically removed. The prune keeps
+		// only the root→leaf path, so append a `usage` entry AT the branch point
+		// and prune to THAT entry — it survives on the keep path. Usage entries
+		// are invisible to the model context (sessionEntryToContextMessages
+		// skips them), so this adds nothing the model sees.
+		const preserved = sumSideBranchUsage(ctx.sessionManager, target);
+		let keepLeaf = target;
+		if (preserved) {
+			if (ctx.sessionManager.getLeafId() !== target) await ctx.navigateTree(target);
+			const u = sm.appendUsage(
+				"qq_side",
+				preserved.provider,
+				preserved.model,
+				preserved.usage,
+				"qq side thread (removed)",
+			);
+			keepLeaf = u.id;
+		}
+		sm.pruneBranches(keepLeaf);
 		ctx.ui.notify("Side thread removed from the session.", "info");
 		return "pruned";
 	}

@@ -21,7 +21,10 @@ that works wins:
 
 1. **prune** (pin matches the running pi): the thread is physically removed
    from the session file — no dead branch, same session id. (Other orphan
-   branches are tidied too.)
+   branches are tidied too.) The thread's **billed usage is preserved** as a
+   context-invisible marker at the branch point, so the tokens it really
+   spent still show in the session stats (`/cost`, footer) even though the
+   entries are gone.
 2. **rewind** (any other pi): the baseline — the thread is orphaned in the
    tree (visible in `/tree`). There is deliberately **no fork tier**: a
    fork would create a *duplicate session file* in `/resume` on every

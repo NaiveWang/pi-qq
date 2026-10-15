@@ -8,7 +8,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { MockSession, MockCtx } from "./types.ts";
-import type { MockEntry } from "./types.ts";
+import type { MockEntry, MockUsage } from "./types.ts";
 import qqExtension from "../extensions/qq.ts";
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,8 @@ export interface AgentBehavior {
 	 * reasoning chain). Exercises the activity-aware settle timeout.
 	 */
 	stream?: { everyMs: number; totalMs: number };
+	/** Billed usage for the side answer (exercises session-stat preservation on prune). */
+	usage?: MockUsage;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +141,13 @@ export class MockPi {
 		}
 		const answer = this.behavior.answer;
 		if (typeof answer === "string") {
-			this.session.add("message", { role: "assistant", content: [{ type: "text", text: answer }] });
+			this.session.add("message", {
+				role: "assistant",
+				content: [{ type: "text", text: answer }],
+				usage: this.behavior.usage,
+				provider: "mock",
+				model: "mock-model",
+			});
 		}
 		this.ctx.idle = true;
 		this.emit("agent_settled", {});

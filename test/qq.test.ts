@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { config, detectSideThreadRoot, installSessionPrune } from "../extensions/qq.ts";
 import { makeEnv, run, waitFor, externalRun, isPending, submitInput, type Env } from "./mock.ts";
-import { MockSession } from "./types.ts";
+import { MockSession, mkUsage } from "./types.ts";
 
 // Restore shrunk timeouts after each test.
 const DEFAULTS = { ...config };
@@ -1055,6 +1055,37 @@ test("dismiss PRUNES the thread when the patch is available (no fork, no rewind)
 	assert.deepEqual(env.ctx.navigatedTo, [], "no rewind");
 	assert.equal(env.ctx.forkCalls.length, 0, "no fork");
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
+});
+
+test("dismiss PRUNE preserves the side thread's billed usage (still counts in the stats)", async () => {
+	// The side answer bills 50 tokens; the seeded main answer bills 100.
+	const env = makeEnv({ answer: "42", usage: mkUsage(30, 20) });
+	const homeLeaf = env.session.leafId!;
+	env.session.pruneBranches = (id) => env.session.pruneSim(id); // simulate patched pi
+	await toPending(env, "qq", "q?");
+	env.ctx.press("d");
+	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
+
+	// The side answer is physically gone ...
+	const sideAnswer = [...env.session.entries.values()].find(
+		(e) => e.type === "message" && e.message?.role === "assistant" && (e.message?.content as { type: string; text?: string }[]).some((c) => c.text === "42"),
+	);
+	assert.equal(sideAnswer, undefined, "side answer pruned from the file");
+
+	// ... but its billed usage is preserved as a `usage` entry at the branch point.
+	const preserved = [...env.session.entries.values()].find((e) => e.type === "usage" && e.usage);
+	assert.ok(preserved, "a usage entry survived the prune");
+	assert.equal(preserved!.usage!.totalTokens, 50, "preserved the side thread's 50 tokens");
+	assert.equal(preserved!.parentId, homeLeaf, "anchored at the branch point");
+	assert.equal(env.session.leafId, preserved!.id, "leaf re-pinned to the preserved usage entry");
+
+	// The session stats (sum of all entries' usage) still see main (100) + preserved side (50).
+	let total = 0;
+	for (const e of env.session.entries.values()) {
+		if (e.type === "message" && e.message?.role === "assistant" && e.message.usage) total += e.message.usage.totalTokens;
+		else if (e.type === "usage" && e.usage) total += e.usage.totalTokens;
+	}
+	assert.equal(total, 150, "main (100) + preserved side (50) still count");
 });
 
 test("dismiss REWINDS in place when the patch is absent — even if ctx.fork exists (never fork)", async () => {
