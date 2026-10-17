@@ -143,10 +143,10 @@ export const config = {
 	 * The pi versions the pruneBranches self-patch may install on. An explicit
 	 * allowlist, NOT a semver range: the patch touches private-by-convention
 	 * internals, so a version is added only after verifying SessionManager is
-	 * byte-identical (1.1.0 and 1.2.0 are). On any other pi the patch does
-	 * not install and drops degrade to an in-place rewind.
+	 * byte-identical (1.1.0, 1.2.0 and 1.3.0 are). On any other pi the patch
+	 * does not install and drops degrade to an in-place rewind.
 	 */
-	patchTargetPiVersions: ["1.1.0", "1.2.0"],
+	patchTargetPiVersions: ["1.1.0", "1.2.0", "1.3.0"],
 };
 
 // ── True deletion of dismissed threads: additive SessionManager self-patch ──
