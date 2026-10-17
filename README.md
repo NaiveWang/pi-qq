@@ -21,7 +21,10 @@ that works wins:
 
 1. **prune** (pin matches the running pi): the thread is physically removed
    from the session file — no dead branch, same session id. (Other orphan
-   branches are tidied too.)
+   branches are tidied too.) The thread's **billed usage is preserved** as a
+   context-invisible marker at the branch point, so the tokens it really
+   spent still show in the session stats (`/cost`, footer) even though the
+   entries are gone.
 2. **rewind** (any other pi): the baseline — the thread is orphaned in the
    tree (visible in `/tree`). There is deliberately **no fork tier**: a
    fork would create a *duplicate session file* in `/resume` on every
@@ -77,78 +80,33 @@ cache is still intact for the next main turn). Tool policy is two-layer:
 
 ## How it works
 
-The Q&A takes over the main transcript like a normal turn and **stays there**
-until you decide its fate. The **first** side answer ends in a keypress
-choice:
+The Q&A takes over the transcript like a normal turn and **stays there** until
+you decide its fate.
 
-- **f** → **open the side thread**: the input box becomes your side
-  conversation. **Plain text is the next side question** (answered with the
-  whole thread in context, no `/qq` prefix needed). `/ro` toggles the
-  follow-up policy; `/sub` starts a sub-thread (a boundary within the same
-  session — it does not change what `/nvm` and `/merge` span); `/merge`
-  keeps the whole session as conversation. **Once in the thread there is no
-  keypress prompt after a follow-up answer** — it simply stays on the branch
-  and you keep typing the next follow-up. The session ends when you run
-  `/nvm` (drop it), `/merge` (keep it), or when a normal (non-`/qq`) message
-  lands via another path (rpc driver, genuinely unknown slash text, …) —
-  that message absorbs the thread: it can never be rewound away again.
-  (A mistyped mode command is NOT such a message — see near-miss above.)
-- **exit mid-thread** → the thread survives in the session file. When pi
-  next starts on that session, the extension detects that the conversation
-  ends in side Q&A and **re-opens the side thread**: an answered one re-
-  enters the mode (type to follow up, `/nvm` drops it); one that was still
-  streaming only restores the thread so `/nvm` can still drop it. A merged
-  thread (its merge left a context-invisible close marker) and an absorbed
-  one are correctly NOT re-opened.
-- **m** → **merge** (first answer only): the side Q&A becomes part of the
-  conversation and the next message continues right after the answer. (In
-  the thread, `/merge` is the command-level equivalent — same effect, any
-  time.)
-- **any other key** → **dismiss** (first answer only): the whole side thread
-  (every question and answer in it) is rewound away and the conversation
-  continues as if it never happened. Printable keys pass through, so you can
-  start typing your next prompt immediately.
-
-Mechanically, a pi session is an append-only **tree** of entries and the model
-context is always built from the root→leaf path. `/qq` exploits that:
-
-1. Remembers the current leaf (`homeLeaf`), appends a marker entry, and sends
-   the question (with its tool-policy note) — the Q&A lands on a
-   **temporary side branch**.
-2. Waits for the run to fully settle (`agent_settled`).
-3. First answer: puts up "f follow-up · m merges · any other key
-   dismisses" (footer status + notification) and waits for **your**
-   keypress. Follow-up answer (side thread open): no keypress at all — the
-   answer stays and the input box is already yours.
-4. On dismiss/`/nvm`, **drops the thread at its root** — the leaf before the
-   thread's first question, so a whole follow-up thread vanishes at once —
-   via the first available tier: prune (exact pi match) → leaf rewind (any
-   other pi). On merge, it simply doesn't rewind.
-
-After a dismiss the exchange is excluded from all future model requests and
-compaction. With the self-patch active it is also physically removed from the
-session file; on any other pi it remains as a dead branch, visible in `/tree`
-(you can re-attach it later by navigating to it).
+- **First answer** → a keypress gate: **f** open the side thread, **m** merge
+  it into the conversation, **d** dismiss it. Any other key is ignored (the
+  gate stays armed, so a stray press can't dismiss by accident).
+- **In the thread** → no keypress. Plain text is the next follow-up; `/ro`
+  toggles policy, `/sub` starts a sub-thread, `/merge` keeps it all, `/nvm`
+  drops it. A normal (non-`/qq`) message absorbs the thread — it can never be
+  rewound away again.
+- **Mechanically** — a pi session is an append-only tree and the model context
+  is the root→leaf path. `/qq` sends the question onto a temporary side
+  branch, waits for the run to settle, then on dismiss/`/nvm` drops the whole
+  branch at its root (prune on a pinned pi, rewind otherwise); on merge it
+  simply doesn't rewind.
+- **Exit mid-thread** → the thread survives in the session file and is
+  re-detected on the next start (answered → re-enters the mode; merged or
+  absorbed → not re-opened).
 
 ## Compaction safety
 
-A side question must never compact the **main** conversation. If the session
-is near its token limit, the side turn itself can trip auto-compaction — and
-a compaction entry stranded on the main line would truncate the real history
-out of context (its summary would have been written from side-branch
-context). So during a side turn pi-qq:
-
-- **cancels auto-compaction** (`session_before_compact` → `cancel`),
-- **waits for true idle** (no run, no compaction) before rewinding —
-  `navigateTree` refuses while the session is busy,
-- **notifies** when a rewind fails instead of failing silently (the Q&A stays
-  visible so you can see it; re-run the command to dismiss again),
-- warns up front when the context is ≥ 90% of the window (the side turn may
-  overflow; `/compact` first is the clean move).
-
-**Cost note:** the side request still sends the full current context (the
-model needs it to answer "which of the two approaches…"). What `/qq` saves is
-the recurring cost — the exchange never rides along in every subsequent turn.
+A side question must never compact the **main** conversation. During a side
+turn pi-qq cancels auto-compaction, waits for true idle before rewinding
+(`navigateTree` refuses while busy), warns up front at ≥ 90% of the context
+window, and notifies if a rewind fails. The side request still sends the full
+current context (the model needs it) — what `/qq` saves is the recurring cost:
+the exchange never rides along in every later turn.
 
 ## Install
 
@@ -195,7 +153,8 @@ plus an in-memory session tree exercise the real logic, no pi process
 needed). The scenario matrix covers:
 
 - **lifecycle** — send → settle → PENDING → dismiss/merge, key semantics
-  (case, pass-through vs consume), status line, prompt notes
+  (case, d dismisses vs other keys ignored and the gate stays armed), status
+  line, prompt notes
 - **threads** — follow-up chains, context inheritance, thread absorption by
   a normal message, orphaning via `/tree`
 - **side-thread mode** — plain-text follow-ups, **no keypress gate after a

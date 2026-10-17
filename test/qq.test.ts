@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { config, detectSideThreadRoot, installSessionPrune } from "../extensions/qq.ts";
 import { makeEnv, run, waitFor, externalRun, isPending, submitInput, type Env } from "./mock.ts";
-import { MockSession } from "./types.ts";
+import { MockSession, mkUsage } from "./types.ts";
 
 // Restore shrunk timeouts after each test.
 const DEFAULTS = { ...config };
@@ -44,10 +44,10 @@ async function toPending(env: Env, cmd: string, question: string): Promise<void>
 // 1. Command surface
 // ---------------------------------------------------------------------------
 
-test("registers /qq and /qqro; /ro and /nvm are input-level (mode-scoped), not commands", () => {
+test("registers /qq, /qqro and /nvm as commands; /ro, /sub, /merge are input-level (mode-scoped), not commands", () => {
 	const env = makeEnv();
-	for (const name of ["qq", "qqro"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
-	for (const name of ["ro", "nvm"]) assert.ok(!env.pi.commands.has(name), `/${name} NOT a registered command`);
+	for (const name of ["qq", "qqro", "nvm"]) assert.ok(env.pi.commands.has(name), `/${name} registered`);
+	for (const name of ["ro", "sub", "merge"]) assert.ok(!env.pi.commands.has(name), `/${name} NOT a registered command`);
 	assert.match(env.pi.commands.get("qq")!.description, /f follow-up/);
 	assert.match(env.pi.commands.get("qqro")!.description, /read-only/);
 });
@@ -84,7 +84,7 @@ test("happy path: marker + labeled message, PENDING, dismiss rewinds to homeLeaf
 	assert.match(sent, /Do not use any tools/);
 
 	// Dismiss → rewind to homeLeaf.
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
 	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed")));
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
@@ -105,7 +105,7 @@ test("merge (m): no rewind, close marker at the leaf, thread ends", async () => 
 	// Thread ended: a NEW side question starts a fresh thread — dismissing it
 	// must NOT rewind past the merged Q&A.
 	const p2 = await toPending(env, "qq", "q2");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => !!env.session.findUserEntry("qq: q1"), "merged Q&A survives a later dismiss");
 	assert.ok(!env.session.findUserEntry("qq: q2"), "only the new question was removed");
@@ -126,27 +126,47 @@ test("M and F are case-insensitive", async () => {
 	assert.ok(env.ctx.notifyOf((m) => m.includes("follow-up")));
 });
 
-test("dismiss: printable key passes through, control key is consumed", async () => {
+test("other keys are swallowed and the gate STAYS armed (no accidental dismiss)", async () => {
 	const env = makeEnv({ answer: "a" });
+	const homeLeaf = env.session.leafId!;
 	const p = await toPending(env, "qq", "q");
-	const resPrintable = env.ctx.press("h");
-	assert.equal(resPrintable[0], undefined, "printable key passes through to the editor");
-	await p;
+	const answerLeaf = env.session.leafId!;
+	assert.notEqual(answerLeaf, homeLeaf, "the side answer advanced the leaf");
 
-	const p2 = await toPending(env, "qq", "q2");
-	const resCtrl = env.ctx.press("\u0003");
-	assert.deepEqual(resCtrl[0], { consume: true }, "control key is consumed");
-	await p2;
+	// A stray printable key: consumed, thread NOT dismissed, gate still armed.
+	const res1 = env.ctx.press("h");
+	assert.deepEqual(res1[0], { consume: true }, "stray printable key is consumed");
+	assert.equal(env.session.leafId, answerLeaf, "stray key did NOT dismiss the thread");
+	assert.ok(isPending(env), "gate still armed after a stray key");
+
+	// A stray control key: also consumed, still armed.
+	const res2 = env.ctx.press("\u0003");
+	assert.deepEqual(res2[0], { consume: true }, "stray control key is consumed");
+	assert.equal(env.session.leafId, answerLeaf, "still not dismissed");
+	assert.ok(isPending(env), "gate still armed");
+
+	// The gate is still armed: an explicit d now dismisses. Wait for the
+	// success notice (emitted AFTER the rewind completes) so both the leaf
+	// update and the notification are done — waiting on the leaf alone races
+	// with the fire-and-forget drop.
+	env.ctx.press("d");
+	await p;
+	await waitFor(
+		() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed")),
+		"dismiss success notice",
+	);
+	assert.equal(env.session.leafId, homeLeaf, "d rewound to homeLeaf");
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
 });
 
 test("status set during PENDING and cleared after the keypress", async () => {
 	const env = makeEnv({ answer: "a" });
 	const p = await toPending(env, "qq", "q");
 	assert.ok(
-		env.ctx.statuses.some((s) => s.key === "qq" && s.status === "side answer · f follow-up · m merges · any other key dismisses the thread"),
+		env.ctx.statuses.some((s) => s.key === "qq" && s.status === "side answer · f follow-up · m merges · d dismisses (other keys ignored)"),
 		"status shown while pending",
 	);
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p;
 	const last = [...env.ctx.statuses].reverse().find((s) => s.key === "qq");
 	assert.equal(last?.status, undefined, "status cleared after keypress");
@@ -157,7 +177,7 @@ test("prompt note: /qq has no tools, /qqro is read-only", async () => {
 	await toPending(env, "qqro", "q");
 	const sent = env.pi.sentMessages[0];
 	assert.match(sent, /read-only tools \(read, grep, find, ls\)/);
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => !isPending(env), "settled");
 });
 
@@ -265,7 +285,7 @@ test("real turn outside the mode absorbs the thread; next /qq starts fresh", asy
 
 	// The next /qq detects the absorption: FRESH thread, and the mode ends.
 	const p2 = await toPending(env, "qq", "q3");
-	env.ctx.press("x"); // dismiss the q3 probe
+	env.ctx.press("d"); // dismiss the q3 probe
 	await p2;
 	await waitFor(() => env.session.leafId === realAnswer.id, "rewound only the new question");
 	assert.ok(env.session.findUserEntry("qq: q1"), "absorbed Q&A stays");
@@ -354,10 +374,33 @@ test("/nvm drops the whole thread and returns to the main conversation", async (
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
 });
 
-test("/nvm with no thread is NOT a command (passes through as a message)", async () => {
+test("/nvm with no thread is a command that passes through as a message", async () => {
 	const env = makeEnv();
-	assert.equal(await submitInput(env, "/nvm"), "message", "not consumed, not a registered command");
-	assert.equal(env.ctx.notifs.length, 0, "no warning — it just goes to the model");
+	assert.equal(await submitInput(env, "/nvm"), "command", "a registered command");
+	assert.ok(
+		env.pi.sentMessages.includes("/nvm"),
+		"outside a side thread it is re-sent to the model as a plain message",
+	);
+});
+
+test("REGRESSION: input-event ctx has NO navigateTree (command ctx does) — why /nvm must be a command", async () => {
+	const env = makeEnv();
+	// Capture the context an ACTUAL input handler receives via the dispatch.
+	// Faithful to pi: the input-event context (createContext) lacks
+	// navigateTree; only the command context (createCommandContext) has it.
+	// The mock enforces this so /nvm (a command) can never regress into an
+	// input handler that crashes with "ctx.navigateTree is not a function".
+	const captured: { ctx?: { navigateTree?: unknown } } = {};
+	env.pi.on(
+		"input",
+		((_e: unknown, ctx: unknown) => {
+			captured.ctx = ctx as { navigateTree?: unknown };
+			return { action: "continue" };
+		}) as unknown as (event: unknown) => unknown,
+	);
+	await submitInput(env, "probe");
+	assert.equal(captured.ctx?.navigateTree, undefined, "the dispatched input ctx has NO navigateTree");
+	assert.equal(typeof env.ctx.navigateTree, "function", "the command ctx HAS navigateTree");
 });
 
 test("/nvm while a side question is in flight warns and does not rewind", async () => {
@@ -586,7 +629,7 @@ test("/tree away after f orphans the thread", async () => {
 	const other = env.session.add("message", { role: "user", content: "other branch" }, threadRoot);
 
 	const p2 = await toPending(env, "qq", "q3");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => env.session.leafId === other.id, "only the new question removed");
 	assert.ok(!env.session.branch(other.id).some((e) => e.message?.content?.toString().startsWith("qq: ")), "no side Q&A on this path");
@@ -620,6 +663,26 @@ test("settle timeout → error, rewind, in-flight released", async () => {
 	env.ctx.press("m");
 	await p2;
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive);
+});
+
+test("activity-aware settle timeout: a long streaming answer survives past the fixed deadline", async () => {
+	// The run streams for 450ms (3x the 150ms deadline) but emits a
+	// message_update every 30ms. The activity-aware timer re-arms on each
+	// update, so it settles cleanly instead of timing out at 150ms.
+	config.settleTimeoutMs = 150;
+	const env = makeEnv({ answer: "long answer", stream: { everyMs: 30, totalMs: 450 } });
+	const homeLeaf = env.session.leafId!;
+	await toPending(env, "qq", "q");
+	assert.ok(!env.ctx.notifyOf((m) => m.includes("timed out")), "no timeout despite total > deadline");
+	assert.ok(env.ctx.notifyOf((m) => m.includes("side answer ready")), "reached PENDING (answer delivered)");
+
+	// Clean up: dismiss (rewinds to homeLeaf), confirm no leaked subscriptions.
+	env.ctx.press("d");
+	await waitFor(
+		() => env.session.leafId === homeLeaf && !!env.ctx.notifyOf((m) => m.includes("Side thread removed")),
+		"dismissed",
+	);
+	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaked subscriptions");
 });
 
 test("failed question mid-thread keeps the thread alive", async () => {
@@ -724,7 +787,7 @@ test("no leaked subscriptions: merge, dismiss, no-answer, and mode exit", async 
 	// dismiss
 	env = makeEnv({ answer: "a" });
 	p = await toPending(env, "qq", "q");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p;
 	await waitFor(() => env.pi.activeCount() === env.pi.baselineActive, "no leaks after dismiss");
 
@@ -815,7 +878,7 @@ test("rewind waits for idle; stuck-busy fails loud without crashing", async () =
 	const homeLeaf = env.session.leafId!;
 	const p = await toPending(env, "qq", "q");
 	env.ctx.idle = false;
-	env.ctx.press("x");
+	env.ctx.press("d");
 	setTimeout(() => {
 		env.ctx.idle = true;
 	}, 50);
@@ -829,7 +892,7 @@ test("rewind waits for idle; stuck-busy fails loud without crashing", async () =
 	const homeLeafB = env.session.leafId!;
 	const p2 = await toPending(env, "qq", "q");
 	env.ctx.idle = false; // stuck
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await p2;
 	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("dismiss failed")), "fail-loud notification");
 	assert.notEqual(env.session.leafId, homeLeafB, "nothing was rewound");
@@ -1008,7 +1071,7 @@ test("dismiss PRUNES the thread when the patch is available (no fork, no rewind)
 	const homeLeaf = env.session.leafId!;
 	env.session.pruneBranches = (id) => env.session.pruneSim(id); // simulate patched pi
 	await toPending(env, "qq", "q?");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
 	assert.deepEqual(env.session.pruneCalls, [homeLeaf], "pruned to the thread root");
 	assert.equal(env.session.leafId, homeLeaf);
@@ -1017,13 +1080,44 @@ test("dismiss PRUNES the thread when the patch is available (no fork, no rewind)
 	assert.equal(env.pi.activeCount(), env.pi.baselineActive, "no leaks");
 });
 
+test("dismiss PRUNE preserves the side thread's billed usage (still counts in the stats)", async () => {
+	// The side answer bills 50 tokens; the seeded main answer bills 100.
+	const env = makeEnv({ answer: "42", usage: mkUsage(30, 20) });
+	const homeLeaf = env.session.leafId!;
+	env.session.pruneBranches = (id) => env.session.pruneSim(id); // simulate patched pi
+	await toPending(env, "qq", "q?");
+	env.ctx.press("d");
+	await waitFor(() => !!env.ctx.notifyOf((m) => m.includes("Side thread removed from the session")), "prune notice");
+
+	// The side answer is physically gone ...
+	const sideAnswer = [...env.session.entries.values()].find(
+		(e) => e.type === "message" && e.message?.role === "assistant" && (e.message?.content as { type: string; text?: string }[]).some((c) => c.text === "42"),
+	);
+	assert.equal(sideAnswer, undefined, "side answer pruned from the file");
+
+	// ... but its billed usage is preserved as a `usage` entry at the branch point.
+	const preserved = [...env.session.entries.values()].find((e) => e.type === "usage" && e.usage);
+	assert.ok(preserved, "a usage entry survived the prune");
+	assert.equal(preserved!.usage!.totalTokens, 50, "preserved the side thread's 50 tokens");
+	assert.equal(preserved!.parentId, homeLeaf, "anchored at the branch point");
+	assert.equal(env.session.leafId, preserved!.id, "leaf re-pinned to the preserved usage entry");
+
+	// The session stats (sum of all entries' usage) still see main (100) + preserved side (50).
+	let total = 0;
+	for (const e of env.session.entries.values()) {
+		if (e.type === "message" && e.message?.role === "assistant" && e.message.usage) total += e.message.usage.totalTokens;
+		else if (e.type === "usage" && e.usage) total += e.usage.totalTokens;
+	}
+	assert.equal(total, 150, "main (100) + preserved side (50) still count");
+});
+
 test("dismiss REWINDS in place when the patch is absent — even if ctx.fork exists (never fork)", async () => {
 	const env = makeEnv({ answer: "42" });
 	const homeLeaf = env.session.leafId!;
 	env.ctx.installForkSim(); // ctx.fork EXISTS but must not be used —
 	// a fork would create a duplicate session file in /resume per dismiss.
 	await toPending(env, "qq", "q?");
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewound to homeLeaf");
 	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf], "plain in-place rewind");
 	assert.equal(env.ctx.forkCalls.length, 0, "NEVER forks");
@@ -1037,7 +1131,7 @@ test("dismiss REWINDS when neither patch nor fork is available (baseline)", asyn
 	const env = makeEnv({ answer: "42" });
 	const homeLeaf = env.session.leafId!;
 	await toPending(env, "qq", "q?"); // unpatched pi: no prune on the mock
-	env.ctx.press("x");
+	env.ctx.press("d");
 	await waitFor(() => env.session.leafId === homeLeaf, "rewind to homeLeaf");
 	assert.deepEqual(env.ctx.navigatedTo, [homeLeaf]);
 	assert.ok(env.ctx.notifyOf((m) => m.includes("Side thread removed from the conversation")));
@@ -1258,6 +1352,37 @@ test("detectSideThreadRoot: /sub boundaries are transparent; close marker still 
 	);
 });
 
+test("detectSideThreadRoot: real on-disk user messages are content-BLOCK arrays, not strings", () => {
+	// sendUserMessage("qq: ...") is stored by pi as [{ type: "text", text }],
+	// not a plain string. The old string-only isSideUser check matched none of
+	// these, so a real mid-thread resume was never detected and the next plain
+	// message silently absorbed the thread. Regression guard for both shapes.
+	const au = (id: string, text: string) => ({
+		id,
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text }] },
+	});
+	const qm = (id: string) => ({ id, type: "custom", customType: "qq", data: { question: "x" } });
+	const an = (id: string) => ({ id, type: "message", message: { role: "assistant", content: [{ type: "text", text: "a" }] } });
+	const real = (id: string) => ({ id, type: "message", message: { role: "user", content: [{ type: "text", text: "back to work" }] } });
+	const base = [au("m0", "main conversation")];
+
+	// Answered thread, array-content side questions → detected, root at m0.
+	assert.deepEqual(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), qm("4"), au("5", "qq: q2"), an("6")]), {
+		root: "m0",
+		answered: true,
+		forks: 0,
+	});
+	// Unanswered trailing question (exited mid-stream), array content.
+	assert.deepEqual(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), qm("4"), au("5", "qq: q2")]), {
+		root: "m0",
+		answered: false,
+		forks: 0,
+	});
+	// Absorbed: a real (non-qq) ARRAY-content message follows → not resumable.
+	assert.equal(detectSideThreadRoot([...base, qm("1"), au("2", "qq: q1"), an("3"), real("4")]), null);
+});
+
 test("/nvm after out-of-band absorption does NOT rewind the real turn (stale state)", async () => {
 	const env = makeEnv({ answer: "a" });
 	const p1 = await toPending(env, "qq", "q1");
@@ -1273,7 +1398,7 @@ test("/nvm after out-of-band absorption does NOT rewind the real turn (stale sta
 	assert.equal(env.ctx.editorComponents.at(-1) !== undefined, true, "stale mode still on");
 
 	const res = await submitInput(env, "/nvm");
-	assert.equal(res, "consumed", "stale /nvm is consumed, not passed through");
+	assert.equal(res, "command", "stale /nvm is a no-op command (not passed through, nothing rewound)");
 	assert.ok(env.session.findUserEntry("qq: q1"), "absorbed side Q&A kept");
 	assert.ok(env.session.findUserEntry("real turn"), "real turn kept — NOTHING rewound");
 	assert.equal(env.ctx.editorComponents.at(-1), undefined, "stale mode ended");

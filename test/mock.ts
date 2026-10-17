@@ -8,7 +8,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { MockSession, MockCtx } from "./types.ts";
-import type { MockEntry } from "./types.ts";
+import type { MockEntry, MockUsage } from "./types.ts";
 import qqExtension from "../extensions/qq.ts";
 
 // ---------------------------------------------------------------------------
@@ -24,6 +24,14 @@ export interface AgentBehavior {
 	delayMs?: number;
 	/** false = the run never settles (timeout tests). */
 	settles?: boolean;
+	/**
+	 * Stream `message_update` events every `everyMs` for `totalMs` before
+	 * settling — simulates a long, actively-streaming answer (e.g. a long
+	 * reasoning chain). Exercises the activity-aware settle timeout.
+	 */
+	stream?: { everyMs: number; totalMs: number };
+	/** Billed usage for the side answer (exercises session-stat preservation on prune). */
+	usage?: MockUsage;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +114,22 @@ export class MockPi {
 			this.ctx.idle = true;
 			return;
 		}
+		if (this.behavior.stream) {
+			// Actively-streaming run: emit message_update on an interval for the
+			// whole duration, then finish. The updates keep re-arming the
+			// activity-aware settle timer, so the run settles even if totalMs is
+			// far longer than settleTimeoutMs.
+			const { everyMs, totalMs } = this.behavior.stream;
+			let elapsed = 0;
+			const tick = () => {
+				this.emit("message_update", {});
+				elapsed += everyMs;
+				if (elapsed >= totalMs) this.finishRun();
+				else setTimeout(tick, everyMs);
+			};
+			setTimeout(tick, everyMs);
+			return;
+		}
 		setTimeout(() => this.finishRun(), this.behavior.delayMs ?? 20);
 	}
 
@@ -117,7 +141,13 @@ export class MockPi {
 		}
 		const answer = this.behavior.answer;
 		if (typeof answer === "string") {
-			this.session.add("message", { role: "assistant", content: [{ type: "text", text: answer }] });
+			this.session.add("message", {
+				role: "assistant",
+				content: [{ type: "text", text: answer }],
+				usage: this.behavior.usage,
+				provider: "mock",
+				model: "mock-model",
+			});
 		}
 		this.ctx.idle = true;
 		this.emit("agent_settled", {});
@@ -184,6 +214,24 @@ export async function waitFor(cond: () => boolean, what: string, ms = 3000): Pro
 export const isPending = (env: Env): boolean => env.ctx.terminal.size > 0;
 
 /**
+ * Faithful to pi: the input-event context (createContext) does NOT expose
+ * navigateTree — only command contexts (createCommandContext) do. The mock
+ * otherwise hands the same full MockCtx to both, which is exactly the
+ * divergence that let /nvm "work" in tests while crashing in pi with
+ * "ctx.navigateTree is not a function". So input handlers get a view of the
+ * context with navigateTree removed.
+ */
+export function inputContext(ctx: MockCtx): MockCtx {
+	return new Proxy(ctx, {
+		get(target, prop) {
+			if (prop === "navigateTree") return undefined;
+			const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+			return typeof v === "function" ? v.bind(target) : v;
+		},
+	});
+}
+
+/**
  * Submit text the way pi's editor would (agent-session prompt()):
  *  1. if the text is a registered slash command, dispatch it IMMEDIATELY
  *     (before the input event — extension commands manage their own LLM
@@ -213,7 +261,7 @@ export async function submitInput(
 		}
 	}
 	for (const h of env.pi.listeners.get("input") ?? []) {
-		const r = (await h({ type: "input", text, source }, env.ctx)) as { action?: string } | undefined;
+		const r = (await h({ type: "input", text, source }, inputContext(env.ctx))) as { action?: string } | undefined;
 		if (r?.action === "handled") return "consumed";
 	}
 	env.pi.sentMessages.push(text);

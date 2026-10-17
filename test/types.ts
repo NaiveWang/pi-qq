@@ -1,12 +1,41 @@
 /** Shared mock types (kept separate so mock.ts and qq.test.ts don't cycle). */
 
+/** Mirrors pi's Usage (the subset the session stats read). */
+export interface MockUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number;
+	reasoning?: number;
+	totalTokens: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+/** Build a MockUsage from input/output token counts (cost zeroed for tests). */
+export function mkUsage(input: number, output: number): MockUsage {
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 export interface MockEntry {
 	id: string;
-	type: string; // "message" | "custom" | ...
+	type: string; // "message" | "custom" | "usage" | ...
 	customType?: string; // set when type === "custom" (mirrors pi's CustomEntry)
 	data?: { question?: string; fork?: boolean; closed?: boolean }; // CustomEntry.data
 	parentId: string | null;
-	message?: { role: string; content: unknown };
+	message?: { role: string; content: unknown; usage?: MockUsage; provider?: string; model?: string; responseModel?: string };
+	// usage-entry fields (type === "usage"), mirroring pi's UsageEntry:
+	usage?: MockUsage;
+	kind?: string;
+	provider?: string;
+	model?: string;
 }
 
 export class MockSession {
@@ -26,9 +55,28 @@ export class MockSession {
 		return this.branch(leafId);
 	}
 
-	add(type: string, message?: { role: string; content: unknown }, parentId?: string): MockEntry {
+	add(
+		type: string,
+		message?: {
+			role: string;
+			content: unknown;
+			usage?: MockUsage;
+			provider?: string;
+			model?: string;
+			responseModel?: string;
+		},
+		parentId?: string,
+	): MockEntry {
 		const parent = parentId !== undefined ? parentId : this.leafId;
 		const e: MockEntry = { id: `e${++this.n}`, type, parentId: parent, message };
+		this.entries.set(e.id, e);
+		this.leafId = e.id;
+		return e;
+	}
+
+	/** Mirrors pi's SessionManager.appendUsage (child of current leaf, advances leaf). */
+	appendUsage(kind: string, provider: string, model: string, usage: MockUsage, note?: string): MockEntry {
+		const e: MockEntry = { id: `e${++this.n}`, type: "usage", parentId: this.leafId, usage, kind, provider, model };
 		this.entries.set(e.id, e);
 		this.leafId = e.id;
 		return e;
@@ -45,10 +93,19 @@ export class MockSession {
 		return out;
 	}
 
-	/** A small main conversation so a branch point exists. */
+	/**
+	 * A small main conversation so a branch point exists. The main answer
+	 * carries a known usage (100 tokens) so tests can check that the session
+	 * stats still see the main conversation's tokens alongside any preserved
+	 * side-thread usage.
+	 */
 	seed(): void {
 		this.add("message", { role: "user", content: "main question" });
-		this.add("message", { role: "assistant", content: [{ type: "text", text: "main answer" }] });
+		this.add("message", {
+			role: "assistant",
+			content: [{ type: "text", text: "main answer" }],
+			usage: mkUsage(60, 40),
+		});
 	}
 
 	/**

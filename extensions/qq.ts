@@ -85,11 +85,11 @@
  *      queued continuations are all done).
  *   3. On settled, if an assistant reply exists: enter PENDING state.
  *      - First answer (no mode yet): footer status + notification tell you
- *        the choices. The first terminal keypress decides: m merges (no
- *        rewind), f opens the side thread, any other key dismisses (rewinds
- *        the whole thread to its root). Dismissal consumes control keys and
- *        passes printable characters through, so you can start typing your
- *        next prompt immediately.
+ *        the choices. A persistent keypress gate waits: m merges (no
+ *        rewind), f opens the side thread, d dismisses (rewinds the whole
+ *        thread to its root). Any other key is swallowed and the gate stays
+ *        armed — a stray keypress can no longer dismiss the thread by
+ *        accident. Only an explicit f / m / d leaves the pending state.
  *      - Follow-up answer (mode active): NO keypress — the answer stays on
  *        the branch, a status + notification point at the input box, and
  *        the next plain text is simply the next follow-up. (A single-key
@@ -114,6 +114,7 @@ import type {
 	ExtensionCommandContext,
 	InputEvent,
 	InputEventResult,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 // pi's EditorFactory (ui.setEditorComponent's factory) is not re-exported
@@ -127,7 +128,12 @@ type QqEditorArgs = QqEditorFactory extends (...args: infer A) => unknown ? A : 
  * can tune them) without touching the logic.
  */
 export const config = {
-	/** How long to wait for the side turn to settle before giving up. */
+	/**
+	 * How long the side turn may go SILENT (no streaming output, no tool
+	 * activity) before it is declared hung. The clock re-arms on every sign of
+	 * life, so a long-but-active answer (e.g. a long reasoning stream) never
+	 * times out — only a run that produces nothing for this long does.
+	 */
 	settleTimeoutMs: 5 * 60 * 1000,
 	/** How long to wait for true idle before declaring a rewind failed. */
 	idleTimeoutMs: 60 * 1000,
@@ -137,10 +143,10 @@ export const config = {
 	 * The pi versions the pruneBranches self-patch may install on. An explicit
 	 * allowlist, NOT a semver range: the patch touches private-by-convention
 	 * internals, so a version is added only after verifying SessionManager is
-	 * byte-identical (1.1.0 and 1.2.0 are). On any other pi the patch does
-	 * not install and drops degrade to an in-place rewind.
+	 * byte-identical (1.1.0, 1.2.0 and 1.3.0 are). On any other pi the patch
+	 * does not install and drops degrade to an in-place rewind.
 	 */
-	patchTargetPiVersions: ["1.1.0", "1.2.0"],
+	patchTargetPiVersions: ["1.1.0", "1.2.0", "1.3.0"],
 };
 
 // ── True deletion of dismissed threads: additive SessionManager self-patch ──
@@ -378,20 +384,139 @@ interface ModeCtl {
  * side questions. The first real turn after the thread root absorbs the
  * thread into the conversation — it can never be rewound away again.
  */
+/** Extract the visible text of a user message, whether pi stored the
+ *  content as a plain string or as a block array. sendUserMessage called
+ *  with a string is normalized to [{ type: "text", text }] on disk, so the
+ *  resume detection MUST handle both or it never matches a real session
+ *  (this is what broke mid-thread resume: every real side question is an
+ *  array, so the string-only check saw no side Q&A to re-anchor on). */
+function userMessageText(content: unknown): string {
+	return typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? (content as { type?: string; text?: string }[])
+					.filter((x) => x?.type === "text")
+					.map((x) => x.text ?? "")
+					.join(" ")
+			: "";
+}
+
 function isRealTurn(e: { type?: string; message?: { role?: string; content?: unknown } }): boolean {
 	if (e.type !== "message") return false;
 	const m = e.message;
 	if (!m || m.role !== "user") return false;
-	const text =
-		typeof m.content === "string"
-			? m.content
-			: Array.isArray(m.content)
-				? (m.content as { type?: string; text?: string }[])
-						.filter((x) => x?.type === "text")
-						.map((x) => x.text ?? "")
-						.join(" ")
-				: "";
+	const text = userMessageText(m.content);
 	return !text.startsWith("qq: ") && !text.startsWith("qqro: ");
+}
+
+/**
+ * A structural copy of pi's Usage (pi-coding-agent does not re-export the
+ * type). Only the fields pi's session stats read are needed; the optional
+ * splits (cacheWrite1h, reasoning) are preserved when present.
+ */
+interface QqUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number;
+	reasoning?: number;
+	totalTokens: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+function addQqUsage(a: QqUsage, b: QqUsage): QqUsage {
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		...(a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined
+			? { cacheWrite1h: (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0) }
+			: {}),
+		...(a.reasoning !== undefined || b.reasoning !== undefined
+			? { reasoning: (a.reasoning ?? 0) + (b.reasoning ?? 0) }
+			: {}),
+		totalTokens: a.totalTokens + b.totalTokens,
+		cost: {
+			input: a.cost.input + b.cost.input,
+			output: a.cost.output + b.cost.output,
+			cacheRead: a.cost.cacheRead + b.cost.cacheRead,
+			cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
+			total: a.cost.total + b.cost.total,
+		},
+	};
+}
+
+/**
+ * The session-manager surface dropThread needs beyond the readonly pick
+ * (appendUsage is a mutating method, so it is not on ReadonlySessionManager).
+ */
+interface QqSessionManager {
+	pruneBranches?: (keepLeafId?: string) => number;
+	getBranch(leafId?: string): SessionEntry[];
+	appendUsage(
+		kind: string,
+		provider: string,
+		model: string,
+		usage: QqUsage,
+		note?: string,
+	): { id: string };
+}
+
+/**
+ * Sum the billed usage of the side branch — everything on the current
+ * root→leaf path after the branch point `targetId`. Mirrors the entry types
+ * pi's own session stats read (assistant + toolResult messages, usage
+ * entries, compaction/branch summaries) so nothing the stats would have
+ * counted is lost when the branch is pruned. Returns null when there is no
+ * usage to preserve. The provider/model come from the last usage-bearing
+ * entry so /cost groups the preserved total under the model that actually
+ * ran the side thread.
+ */
+function sumSideBranchUsage(
+	sm: { getBranch(): SessionEntry[] },
+	targetId: string,
+): { provider: string; model: string; usage: QqUsage } | null {
+	const branch = sm.getBranch();
+	const targetIdx = branch.findIndex((e) => e.id === targetId);
+	if (targetIdx < 0) return null;
+	let total: QqUsage | null = null;
+	let provider = "";
+	let model = "";
+	for (let i = targetIdx + 1; i < branch.length; i++) {
+		const e = branch[i];
+		let u: QqUsage | undefined;
+		let p = "";
+		let m = "";
+		if (e.type === "message") {
+			const msg = e.message as {
+				role: string;
+				usage?: QqUsage;
+				provider?: string;
+				model?: string;
+				responseModel?: string;
+			};
+			if (msg.role === "assistant" && msg.usage) {
+				u = msg.usage;
+				p = msg.provider ?? "";
+				m = msg.responseModel ?? msg.model ?? "";
+			} else if (msg.role === "toolResult" && msg.usage) {
+				u = msg.usage;
+			}
+		} else if (e.type === "usage") {
+			u = e.usage as QqUsage;
+			p = e.provider;
+			m = e.model;
+		} else if ((e.type === "branch_summary" || e.type === "compaction") && (e as { usage?: QqUsage }).usage) {
+			u = (e as { usage?: QqUsage }).usage;
+		}
+		if (!u) continue;
+		total = total ? addQqUsage(total, u) : { ...u };
+		if (p) provider = p;
+		if (m) model = m;
+	}
+	return total ? { provider, model, usage: total } : null;
 }
 
 /**
@@ -401,8 +526,11 @@ function isRealTurn(e: { type?: string; message?: { role?: string; content?: unk
  *  1. PRUNE  (self-patch active — the running pi exactly matches the pin):
  *     the thread is physically removed from the session file: no dead
  *     branch in /tree, same session id. (Also tidies any other orphans.)
+ *     The branch's billed usage is preserved first — a `usage` entry is
+ *     appended at the branch point and the prune keeps it — so the tokens
+ *     keep counting in the session stats even though the entries are gone.
  *  2. REWIND (any other pi): orphan the thread — it leaves the context,
- *     the entries remain in the tree.
+ *     the entries remain in the tree (and so their usage keeps counting).
  *
  * There is deliberately NO fork tier: `ctx.fork()` "removes" the thread
  * by creating a NEW session file holding the entire history, so every
@@ -418,14 +546,34 @@ async function dropThread(
 	target: string,
 	flags: { pruneFallbackNotified: boolean },
 ): Promise<"pruned" | "rewound"> {
-	const sm = ctx.sessionManager as unknown as { pruneBranches?: (keepLeafId?: string) => number };
+	const sm = ctx.sessionManager as unknown as QqSessionManager;
 	if (
 		pruneStatus.installed &&
 		typeof sm.pruneBranches === "function" &&
 		ctx.sessionManager.getSessionId() === sessionId &&
 		(await waitUntilIdle(ctx, config.idleTimeoutMs))
 	) {
-		sm.pruneBranches(target);
+		// Preserve the side branch's billed usage before it is pruned away. The
+		// tokens were really spent, so they must keep counting in the session
+		// stats even though the entries are physically removed. The prune keeps
+		// only the root→leaf path, so append a `usage` entry AT the branch point
+		// and prune to THAT entry — it survives on the keep path. Usage entries
+		// are invisible to the model context (sessionEntryToContextMessages
+		// skips them), so this adds nothing the model sees.
+		const preserved = sumSideBranchUsage(ctx.sessionManager, target);
+		let keepLeaf = target;
+		if (preserved) {
+			if (ctx.sessionManager.getLeafId() !== target) await ctx.navigateTree(target);
+			const u = sm.appendUsage(
+				"qq_side",
+				preserved.provider,
+				preserved.model,
+				preserved.usage,
+				"qq side thread (removed)",
+			);
+			keepLeaf = u.id;
+		}
+		sm.pruneBranches(keepLeaf);
 		ctx.ui.notify("Side thread removed from the session.", "info");
 		return "pruned";
 	}
@@ -491,11 +639,35 @@ async function runInline(
 	// requested in the prompt note AND enforced by the guardrail below.
 	pi.appendEntry(label, { question });
 
+	// Activity-aware settle timeout. A fixed deadline from send would kill a
+	// long-but-active answer (e.g. a /qqro answer with a long reasoning stream
+	// still producing output well past 5 minutes). Instead the timer re-arms
+	// on every sign of life — a streaming chunk (message_update) or a tool
+	// call — so the deadline is "settleTimeoutMs of SILENCE", not
+	// "settleTimeoutMs in total". A genuinely hung run (no output for 5
+	// minutes) still times out; an active one never does.
+	let resolveTimeout: (r: "timeout") => void;
+	let settleTimer: ReturnType<typeof setTimeout> | undefined;
+	let settleTimerFired = false;
+	const armSettleTimer = () => {
+		if (settleTimerFired) return;
+		if (settleTimer !== undefined) clearTimeout(settleTimer);
+		settleTimer = setTimeout(() => {
+			settleTimerFired = true;
+			resolveTimeout("timeout");
+		}, config.settleTimeoutMs);
+	};
+	const settleTimeout = new Promise<"timeout">((r) => (resolveTimeout = r));
+	const offActivity = pi.on("message_update", () => armSettleTimer());
+
 	// Guardrail: block any tool call outside this command's allow-list for
 	// the duration of the side turn. The blocked call becomes an error result
-	// the model sees, so it falls back to a text answer.
+	// the model sees, so it falls back to a text answer. A tool call is also a
+	// sign of life, so it re-arms the settle timer (covers the gap while a
+	// read-only tool runs, when no message_update fires).
 	const allow = policy === "ro" ? new Set(["read", "grep", "find", "ls"]) : new Set<string>();
 	const offToolCall = pi.on("tool_call", (event) => {
+		armSettleTimer();
 		if (allow.has(event.toolName)) return;
 		return {
 			block: true,
@@ -530,21 +702,19 @@ async function runInline(
 	// a leaked session_before_compact handler would silently cancel every
 	// future compaction, and a leaked guardrail would block tools forever.
 	let result: "settled" | "timeout";
-	let settleTimer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		pi.sendUserMessage(
 			images && images.length > 0
 				? [{ type: "text", text: `${label}: ${question}\n\n(${note})` }, ...images]
 				: `${label}: ${question}\n\n(${note})`,
 		);
-		const timeout = new Promise<"timeout">((r) => {
-			settleTimer = setTimeout(() => r("timeout"), config.settleTimeoutMs);
-		});
-		result = await Promise.race([settled.then(() => "settled" as const), timeout]);
+		armSettleTimer(); // start the silence clock
+		result = await Promise.race([settled.then(() => "settled" as const), settleTimeout]);
 	} finally {
 		if (settleTimer !== undefined) clearTimeout(settleTimer);
 		offSettled();
 		offBeforeCompact();
+		offActivity();
 		offToolCall();
 	}
 
@@ -625,17 +795,20 @@ async function runInline(
 
 	const leaf = sm.getLeafId() as string;
 
-	ctx.ui.setStatus(label, "side answer · f follow-up · m merges · any other key dismisses the thread");
-	ctx.ui.notify(`${label} side answer ready — f follow-up, m merges, any other key dismisses the side thread.`, "info");
+	ctx.ui.setStatus(label, "side answer · f follow-up · m merges · d dismisses (other keys ignored)");
+	ctx.ui.notify(`${label} side answer ready — f follow-up, m merges, d dismisses the side thread (other keys are ignored).`, "info");
 
+	// The gate is PERSISTENT: the handler stays subscribed for every keypress
+	// until one of the three explicit choices (f / m / d) calls offInput().
+	// Any other key is swallowed and the gate re-checks the next key — so a
+	// stray keypress can no longer dismiss the thread by accident.
 	const offInput = ctx.ui.onTerminalInput((data: string) => {
-		offInput();
-		ctx.ui.setStatus(label, undefined);
-
 		// m / M: MERGE — the leaf is already at the side answer, so keeping it
 		// means simply NOT rewinding: the next message continues right after
 		// the Q&A and it becomes part of the live context. Thread ends.
 		if (data === "m" || data === "M") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
 			mode.exit();
 			// Close marker: without it a resumed session cannot tell a MERGED
 			// thread from an OPEN one (identical branch shape). Custom
@@ -651,6 +824,8 @@ async function runInline(
 		// runs as the next side question; /ro toggles the tool policy; /nvm
 		// drops the whole thread.
 		if (data === "f" || data === "F") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
 			mode.enter(ctx);
 			ctx.ui.notify(
 				`${label} side thread open — just type a follow-up (it runs as a side question) · /ro read-only · /sub sub-thread · /merge to main · /nvm back.`,
@@ -659,27 +834,32 @@ async function runInline(
 			return { consume: true };
 		}
 
-		// anything else: DISMISS — drop the WHOLE side thread via the ladder
+		// d / D: DISMISS — drop the WHOLE side thread via the ladder
 		// (prune → rewind; see dropThread, which emits the success
 		// notice itself). The thread state is cleared only AFTER a
 		// successful drop so a failed one can be retried with another /qq.
-		mode.exit();
-		void (async () => {
-			try {
-				if (sm.getLeafId() === leaf) {
-					const target = thread.root ?? homeLeaf;
-					await dropThread(ctx, sessionId, target, dropFlags);
+		if (data === "d" || data === "D") {
+			offInput();
+			ctx.ui.setStatus(label, undefined);
+			mode.exit();
+			void (async () => {
+				try {
+					if (sm.getLeafId() === leaf) {
+						const target = thread.root ?? homeLeaf;
+						await dropThread(ctx, sessionId, target, dropFlags);
+					}
+					clearThread(thread);
+				} catch (e) {
+					ctx.ui.notify(`/${label} dismiss failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
 				}
-				clearThread(thread);
-			} catch (e) {
-				ctx.ui.notify(`/${label} dismiss failed: ${e instanceof Error ? e.message : String(e)} — the side Q&A is still in the transcript.`, "error");
-			}
-		})();
-		// Swallow control/escape keys (so they don't trigger editor actions);
-		// pass printable characters through so you can start typing the next
-		// prompt immediately.
-		const printable = /\p{L}|\p{N}|\p{P}|\p{S}|\p{Z}/u.test(data);
-		return printable ? undefined : { consume: true };
+			})();
+			return { consume: true };
+		}
+
+		// anything else: NO ACTION — swallow the key and stay in PENDING. The
+		// handler is NOT unsubscribed, so the next keypress is checked again.
+		// Only an explicit f / m / d leaves the pending state.
+		return { consume: true };
 	});
 }
 
@@ -723,11 +903,14 @@ export function detectSideThreadRoot(
 	// skips over it (it is not a question marker, not a close marker).
 	const isForkMarker = (e: QqBranchEntry) =>
 		e.type === "custom" && (e.customType === "qq" || e.customType === "qqro") && e.data?.fork === true;
-	const isSideUser = (e: QqBranchEntry) =>
-		e.type === "message" &&
-		e.message?.role === "user" &&
-		typeof e.message.content === "string" &&
-		(e.message.content.startsWith("qq: ") || e.message.content.startsWith("qqro: "));
+	const isSideUser = (e: QqBranchEntry) => {
+		const text = userMessageText(e.message?.content);
+		return (
+			e.type === "message" &&
+			e.message?.role === "user" &&
+			(text.startsWith("qq: ") || text.startsWith("qqro: "))
+		);
+	};
 	const isAnswer = (e: QqBranchEntry) => e.type === "message" && e.message?.role === "assistant";
 
 	let j = branch.length - 1;
@@ -879,7 +1062,10 @@ export default function qqExtension(pi: ExtensionAPI) {
 				getSuggestions: (lines, line, col, opts) =>
 					current.getSuggestions(lines, line, col, opts).then((s) => {
 						if (!s) return s;
-						const hidden = new Set(sideMode ? ["qq", "qqro"] : []);
+						// /nvm is a real command but a mode command — keep it out of
+						// the slash list always; /qq//qqro are hidden while in the
+						// thread (hidden == declined in-mode).
+						const hidden = new Set(sideMode ? ["qq", "qqro", "nvm"] : ["nvm"]);
 						const items = s.items.filter((it) => !hidden.has(it.value));
 						return items.length === 0 ? null : { ...s, items };
 					}),
@@ -1035,21 +1221,73 @@ export default function qqExtension(pi: ExtensionAPI) {
 			},
 		});
 
-	register("qq", "Quick side question (no tools) — f follow-up, m merges, any other key dismisses the thread");
+	register("qq", "Quick side question (no tools) — f follow-up, m merges, d dismisses the thread");
 	register(
 		"qqro",
-		"Quick side question (read-only tools only) — f follow-up, m merges, any other key dismisses",
+		"Quick side question (read-only tools only) — f follow-up, m merges, d dismisses",
 	);
 
-	// /ro, /sub, /merge and /nvm are MODE-SCOPED. pi's command registry is
+	// /nvm (drop the whole side session) IS a registered command — unlike
+	// /ro, /sub, /merge, dropping needs ctx.navigateTree, which only a
+	// COMMAND context has (the input-event context does not — the input
+	// handler used to call dropThread and crashed with "navigateTree is
+	// not a function"). So /nvm is registered: inside a side thread (fresh
+	// or resumed) it drops via the command context; outside one it passes
+	// through to the model as a plain message, the same as any unknown
+	// slash text. It is hidden from autocomplete — a mode command you learn
+	// from the mode banner.
+	pi.registerCommand("nvm", {
+		description:
+			"Side thread only: drop the whole side session (never mind). Outside a side thread it is sent to the model as a message.",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const c = ctx;
+			if (sideMode || thread.root) {
+				if (inFlight) {
+					c.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
+					return;
+				}
+				if (!threadAlive(c.sessionManager)) {
+					// A stale root (absorbed out-of-band or orphaned) must
+					// NEVER be rewound — that would drop real conversation.
+					exitMode();
+					clearThread(thread);
+					return;
+				}
+				const sessionId = c.sessionManager.getSessionId();
+				const root = thread.root && thread.sessionId === sessionId ? thread.root : null;
+				exitMode();
+				if (root) {
+					try {
+						await dropThread(c, sessionId, root, dropFlags);
+						clearThread(thread);
+					} catch (err) {
+						c.ui.notify(
+							`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)}`,
+							"error",
+						);
+					}
+				} else {
+					clearThread(thread);
+					c.ui.notify("Back to the main conversation — the side session is dropped.", "info");
+				}
+				return;
+			}
+			// Outside a side thread: pass through to the model as a message.
+			const fullText = args.trim() ? `/nvm ${args.trim()}` : "/nvm";
+			pi.sendUserMessage(fullText);
+		},
+	});
+
+	// /ro, /sub and /merge are MODE-SCOPED. pi's command registry is
 	// static (no unregister), so they are NOT registered commands at all —
 	// this permanent input handler (registered before the mode handler
 	// below) intercepts them instead: inside a side thread (or with a
 	// restored thread) it consumes them; outside, it lets them pass
 	// through, so pi treats them like any unknown slash text — a plain
 	// message. (pi dispatches REGISTERED extension commands before the
-	// input event — agent-session prompt() — so /qq and /qqro cannot be
-	// intercepted here; their in-mode guard lives in the command handler.
+	// input event — agent-session prompt() — so /qq, /qqro and /nvm cannot
+	// be intercepted here: /qq//qqro's in-mode guard lives in the command
+	// handler, and /nvm is itself a command that passes through there.
 	// And pi's BUILT-IN /fork — fork the session — wins the bare /fork
 	// exact match, which is why the sub-thread command is /sub.)
 	pi.on("input", async (event: InputEvent, ctx) => {
@@ -1120,40 +1358,8 @@ export default function qqExtension(pi: ExtensionAPI) {
 			c.ui.notify("Side session merged — everything since the first /qq is now part of the conversation.", "info");
 			return { action: "handled" };
 		}
-		if (text === "/nvm" || text.startsWith("/nvm ")) {
-			if (!sideMode && !thread.root) return { action: "continue" };
-			if (inFlight) {
-				c.ui.notify("A side question is in flight — wait for it (or abort with esc), then /nvm.", "warning");
-				return { action: "handled" };
-			}
-			if (!threadAlive(c.sessionManager)) {
-				// A stale root (absorbed out-of-band, e.g. an rpc turn, or
-				// orphaned) must NEVER be rewound — that would drop real
-				// conversation. Clear the stale state and end the mode.
-				exitMode();
-				clearThread(thread);
-				return { action: "handled" };
-			}
-			const sessionId = c.sessionManager.getSessionId();
-			const root = thread.root && thread.sessionId === sessionId ? thread.root : null;
-			exitMode();
-			if (root) {
-				try {
-					await dropThread(c, sessionId, root, dropFlags);
-					clearThread(thread);
-				} catch (err) {
-					// Keep the thread state so /qq + any key can retry the rewind.
-					c.ui.notify(
-						`Failed to dismiss the side thread: ${err instanceof Error ? err.message : String(err)} — press /qq and hit any key to retry.`,
-						"error",
-					);
-				}
-			} else {
-				clearThread(thread);
-				c.ui.notify("Back to the main conversation.", "info");
-			}
-			return { action: "handled" };
-		}
+		// /nvm is a registered command (see above) — pi dispatches it before
+		// the input event, so it never reaches this handler.
 		return { action: "continue" };
 	});
 }
